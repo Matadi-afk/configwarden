@@ -236,7 +236,7 @@ def test_mcp_file_detection(name, expected) -> None:
 
 def test_vulnerable_example_triggers_every_mcp_rule() -> None:
     ids = set(rule_ids(EXAMPLES / "vulnerable-mcp"))
-    expected = {f"CW{number}" for number in range(101, 111)}  # CW101 à CW110
+    expected = {f"CW{number}" for number in range(101, 112)}  # CW101 à CW111
     assert expected <= ids
 
 

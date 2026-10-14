@@ -25,7 +25,7 @@
     },
     "sandbox": {
       "command": "docker",
-      "args": ["run", "-i", "--rm", "--privileged", "-v", "/var/run/docker.sock:/var/run/docker.sock", "mcp/sandbox:1.0"]
+      "args": ["run", "-i", "--rm", "--privileged", "-v", "/var/run/docker.sock:/var/run/docker.sock", "mcp/sandbox:latest"]
     },
     "notes": {
       "command": "npx",

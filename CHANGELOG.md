@@ -5,6 +5,12 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
 
 ## [Unreleased]
 
+### Added
+- **CW111 (medium)**: container image run by `docker run`, `podman run` or `nerdctl run` without a digest or an exact version. Reported: no tag (Docker pulls `:latest`), `:latest`, `:main`, `:stable` and other floating tags, a tag without any digit (`:alpine`) and a major version only (`:20`, `:v1`). A digest (`@sha256:…`) is recommended; an exact version (`:1.2.3`) is accepted. Docker Hub official images (`node`, `python`) and local registries (`localhost:5000/…`) are not reported, since no one else can publish there. Global options, grouped short options (`-it`, `-eKEY=V`) and `docker container run` are understood; an unknown option stops the analysis instead of guessing. Measured on 3,099 published configuration examples: 85 of the 110 `docker run` lines are affected.
+
+### Changed
+- **Every command of a shell script is now checked**, not only the first one. In `bash -c "cd /srv && npx -y server"`, only `cd /srv` was read: CW101 reported the script, but an unpinned package (CW102), an unverified source (CW107), a dangerous container (CW106) or an unpinned image (CW111) further down went unnoticed. Commands separated by `;`, `&&`, `||`, `|`, `&`, parentheses or a new line are read, in `bash -c`, `sh -c`, `su -c`, `cmd /c`, `pwsh -Command` and in a command line written in `command`; leading `VAR=value`, `exec`, `then`, `do`… are skipped, and the word after a redirection (`> file`) is not taken for a command. Limits: 20 extra commands per server, shared by nested scripts. On 3,099 published examples, 4 servers hid such a problem.
+
 ## [0.3.0] - 2026-10-08
 
 ### Security

@@ -29,7 +29,7 @@ configwarden scan .
 git clone https://github.com/Matadi-afk/configwarden
 cd configwarden
 pip install .
-configwarden scan examples/vulnerable-mcp   # 14 findings
+configwarden scan examples/vulnerable-mcp   # 15 findings
 configwarden scan examples/safe-mcp         # the fixed version: no issues
 ```
 
@@ -42,7 +42,7 @@ configwarden scan examples/safe-mcp         # the fixed version: no issues
     mcp.json:26  Server 'sandbox' runs a container with a mount of '/var/run/docker.sock'.
     Fix: Remove --privileged, host namespaces and mounts of '/', the home directory or the Docker socket. ...
 
-Scanned 3 file(s), skipped 0. 14 finding(s): 0 critical, 12 high, 2 medium, 0 low.
+Scanned 3 file(s), skipped 0. 15 finding(s): 0 critical, 12 high, 3 medium, 0 low.
 ```
 
 Every value in `examples/` is a fake placeholder, and the example files are named so that no AI client loads them.
@@ -63,6 +63,9 @@ Every value in `examples/` is a fake placeholder, and the example files are name
 | CW108 | medium | Tools auto-approved (`alwaysAllow`, `autoApprove`, `trust: true`): no human confirmation |
 | CW109 | high | AI client set to approve everything: Claude Code `enableAllProjectMcpServers` or `bypassPermissions`, VS Code `chat.tools.global.autoApprove`, Zed, Cursor `*:*`, Kiro Autopilot |
 | CW110 | high | TLS certificate checks turned off: `NODE_TLS_REJECT_UNAUTHORIZED=0`, `*_SSL_VERIFY=false`, `--insecure`, `--strict-ssl=false`, `--allow-insecure-host` |
+| CW111 | medium | Container image run by `docker run`, `podman run` or `nerdctl run` without a digest or an exact version: no tag, `:latest`, `:main`, `:stable`, a major version only (`:20`); Docker Hub official images (`node`) and local registries are ignored |
+
+Commands hidden later in a shell script (`bash -c "cd /srv && npx -y server"`) are checked too.
 
 Run `configwarden rules` to list them from the CLI.
 

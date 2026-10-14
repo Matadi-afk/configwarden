@@ -21,7 +21,8 @@ src/configwarden/
   cli.py            Commandes `scan` et `rules`, codes de sortie 0/1/2 ; --output refuse d'écrire à travers un lien symbolique
   scanner.py        Parcours des fichiers (sans suivre les symlinks ; fichiers ordinaires seulement ; ignore binaires et > 1 Mo ; lit l'UTF-16/32 avec BOM) + appel des règles
   models.py         Severity (LOW < MEDIUM < HIGH < CRITICAL), Rule, Finding (chemin et message assainis à la création)
-  commands.py       analyse() : retire les enveloppes (cmd /c, wsl, env -S, sudo, uv run, bash -c, su -c…), ramène pnpm dlx / bun x / uv tool run… à npx / uvx et relève les risques CW101
+  commands.py       analyse() : retire les enveloppes (cmd /c, wsl, env -S, sudo, uv run, bash -c, su -c…), ramène pnpm dlx / bun x / uv tool run… à npx / uvx et relève les risques CW101 ; suit TOUTES les commandes d'un script (Launch.commands : 1 + 20 au plus, limite commune aux scripts imbriqués)
+  containers.py     run_image() : image lancée par « docker/podman/nerdctl run » (options globales, options courtes groupées, option inconnue = analyse arrêtée) ; parse_reference() : grammaire officielle d'une image ; pinning_problem() pour CW111
   values.py         Forme d'une valeur : modèle à remplir, booléen, nombre, mot, chemin (filtre les fausses alertes de CW001 et CW103)
   jsonc.py          loads() : JSON strict, sinon JSON avec commentaires et virgules finales (temps linéaire, positions conservées)
   redact.py         redact() masque un secret ; redact_url() masque identifiants et paramètres d'URL ; url_origin() ne garde que « schéma://hôte/… » ; sanitize() neutralise les caractères de contrôle et invisibles
@@ -29,10 +30,10 @@ src/configwarden/
   rules/
     __init__.py     ALL_RULES = liste de toutes les règles
     secrets.py      CW001 : secrets en clair (regex par fournisseur)
-    mcp.py          CW100-CW110 : configurations MCP dangereuses et réglages « tout approuver » ; lit tout fichier .json/.jsonc (voir « Formats reconnus »)
+    mcp.py          CW100-CW111 : configurations MCP dangereuses et réglages « tout approuver » ; lit tout fichier .json/.jsonc (voir « Formats reconnus »)
   reporters/        text.py, json_reporter.py, sarif.py (+ RENDERERS dans __init__)
-tests/              pytest ; conftest.py fournit fake_secret() et write_mcp ; test_hardening.py rejoue les attaques connues ; test_real_configs.py couvre le format de chaque outil IA ; test_review_fixes.py rejoue les constats de l'Auditeur et du grand test
-examples/           vulnerable-mcp/ (doit déclencher CW101-CW110) et safe-mcp/ (doit rester propre). Fichiers nommés pour qu'aucun outil IA ne les charge (jamais `.vscode/mcp.json`, `.mcp.json`, `.claude/settings.json`…)
+tests/              pytest ; conftest.py fournit fake_secret() et write_mcp ; test_hardening.py rejoue les attaques connues ; test_real_configs.py couvre le format de chaque outil IA ; test_review_fixes.py rejoue les constats de l'Auditeur et du grand test ; test_container_images.py couvre CW111 ; test_script_commands.py les commandes suivantes d'un script
+examples/           vulnerable-mcp/ (doit déclencher CW101-CW111) et safe-mcp/ (doit rester propre). Fichiers nommés pour qu'aucun outil IA ne les charge (jamais `.vscode/mcp.json`, `.mcp.json`, `.claude/settings.json`…)
 docs/GUIDE-FR.md    Guide d'installation pas à pas pour débutant (Windows/macOS)
 ```
 
@@ -52,8 +53,9 @@ docs/GUIDE-FR.md    Guide d'installation pas à pas pour débutant (Windows/macO
 | CW108 | medium | rules/mcp.py | Outils approuvés sans confirmation (`alwaysAllow`, `autoApprove`, `trust: true`) |
 | CW109 | high | rules/mcp.py | Réglage de l'outil IA qui approuve tout : Claude Code (`enableAllProjectMcpServers`, `bypassPermissions`, `skipDangerousModePermissionPrompt`), VS Code (`chat.tools.global.autoApprove`), Zed, Cursor (`*:*`), Kiro (Autopilot) |
 | CW110 | high | rules/mcp.py | Vérification TLS coupée : `NODE_TLS_REJECT_UNAUTHORIZED=0`, `*_SSL_VERIFY=false`, `--insecure`, `--strict-ssl=false`, `--allow-insecure-host` |
+| CW111 | medium | rules/mcp.py + containers.py | Image de conteneur sans empreinte ni version précise : pas d'étiquette, `:latest`, `:main`, `:stable`, étiquette sans chiffre, version majeure seule (`:20`) ; images officielles de Docker Hub (un seul nom) et registres locaux ignorés |
 
-Prochain ID libre : **CW002** (secrets) ou **CW111** (MCP).
+Prochain ID libre : **CW002** (secrets) ou **CW112** (MCP).
 
 ## Formats reconnus
 
@@ -134,4 +136,5 @@ Fil rouge du projet : configwarden est un outil de sécurité, il doit être lui
 ## État du projet
 
 - Version 0.3.0 (12 règles) : vrais fichiers de configuration, commandes enveloppées, CW109 et SARIF, puis corrections de la revue de l'Auditeur et du grand test sur 3 099 exemples publiés (règle CW110). 572 tests. Notes de version dans `CHANGELOG.md` : à compléter à chaque nouvelle version.
+- En cours (0.4.0) : CW111, image de conteneur non figée (décision du 14 octobre 2026) ; toutes les commandes d'un script vérifiées. 747 tests.
 - Cap fixé jusqu'au 4 novembre 2026 : publier sur GitHub, ajouter 3 règles, faire un premier post. Voir `IDEES.md` pour ce qui est volontairement mis de côté.

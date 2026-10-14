@@ -27,7 +27,7 @@ import re
 from pathlib import PurePosixPath
 from urllib.parse import unquote, urlparse
 
-from configwarden import commands, jsonc, values
+from configwarden import commands, containers, jsonc, values
 from configwarden.models import Finding, Rule, Severity
 from configwarden.redact import redact, redact_url, url_origin
 
@@ -146,6 +146,21 @@ INSECURE_TLS = Rule(
     ),
 )
 
+# CW111 (décision du 14 octobre 2026) : l'équivalent de CW102 pour les conteneurs. Le
+# grand test du 8 octobre a trouvé environ 110 « docker run » dans 3 099 exemples
+# publiés, tous sans version ni empreinte.
+UNPINNED_CONTAINER_IMAGE = Rule(
+    id="CW111",
+    title="Unpinned MCP container image",
+    severity=Severity.MEDIUM,
+    remediation=(
+        "Pin the image to a digest (e.g. `ghcr.io/org/server@sha256:…`), or at least to an "
+        "exact version tag (e.g. `:1.2.3`). `latest` and other floating tags point to whatever "
+        "was pushed last: a new machine, a `docker pull` or `--pull always` would run a "
+        "compromised release without warning."
+    ),
+)
+
 RULES = [
     INVALID_CONFIG,
     SHELL_EXECUTION,
@@ -158,6 +173,7 @@ RULES = [
     AUTO_APPROVED_TOOLS,
     CLIENT_AUTO_APPROVE,
     INSECURE_TLS,
+    UNPINNED_CONTAINER_IMAGE,
 ]
 
 # --- Constantes de détection ---------------------------------------------------
@@ -1031,7 +1047,6 @@ def _check_server(name: str, server: dict, line: int, path: str) -> list[Finding
         # Les enveloppes (cmd /c, wsl, env, sudo, uv run, bash -c…) sont retirées : on
         # vérifie le programme vraiment lancé, et on relève au passage les risques CW101.
         launch = commands.analyse(command, args)
-        exe, args = launch.executable, launch.args
 
         # CW101 : shell, ligne de commande ou code en ligne (une seule alerte par serveur)
         if launch.risks:
@@ -1048,26 +1063,58 @@ def _check_server(name: str, server: dict, line: int, path: str) -> list[Finding
                 )
                 break
 
-        if exe in _PACKAGE_RUNNERS:
-            # CW107 : paquet hors registre (git, URL…). Plus grave qu'CW102, qu'on ne
-            # signale pas en plus pour éviter deux alertes sur la même ligne.
-            source = _untrusted_source(exe, args)
-            if source:
-                # Seulement « schéma://hôte/… » : le chemin ou les paramètres d'une URL
-                # peuvent contenir un jeton, même sans « user:token@ ».
-                add(
-                    UNTRUSTED_PACKAGE_SOURCE,
-                    f"Server '{name}' installs its code from '{url_origin(source)}' "
-                    "instead of a registry.",
-                )
-            else:
-                # CW102 : paquet non figé (un chemin local n'a pas de version à figer)
-                package = _package_spec(exe, args)
-                if package and not _is_local_path(package) and not _package_is_pinned(exe, package):
+        # Chaque commande lancée : la 1re, puis celles qui la suivent dans un script
+        # (« bash -c "cd x && npx …" »), enveloppes retirées.
+        for launched in launch.commands:
+            exe, args = commands.executable_name(launched[0]), launched[1:]
+            if exe in _PACKAGE_RUNNERS:
+                # CW107 : paquet hors registre (git, URL…). Plus grave qu'CW102, qu'on ne
+                # signale pas en plus pour éviter deux alertes sur la même ligne.
+                source = _untrusted_source(exe, args)
+                if source:
+                    # Seulement « schéma://hôte/… » : le chemin ou les paramètres d'une URL
+                    # peuvent contenir un jeton, même sans « user:token@ ».
                     add(
-                        UNPINNED_PACKAGE,
-                        f"Server '{name}' runs '{redact_url(package)}' without a pinned version.",
+                        UNTRUSTED_PACKAGE_SOURCE,
+                        f"Server '{name}' installs its code from '{url_origin(source)}' "
+                        "instead of a registry.",
                     )
+                else:
+                    # CW102 : paquet non figé (un chemin local n'a pas de version à figer)
+                    package = _package_spec(exe, args)
+                    if (
+                        package
+                        and not _is_local_path(package)
+                        and not _package_is_pinned(exe, package)
+                    ):
+                        add(
+                            UNPINNED_PACKAGE,
+                            f"Server '{name}' runs '{redact_url(package)}' "
+                            "without a pinned version.",
+                        )
+
+            # CW106 : conteneur qui casse son isolation
+            if exe in _CONTAINER_ENGINES:
+                for issue in _container_issues(args):
+                    add(DANGEROUS_CONTAINER, f"Server '{name}' runs a container with {issue}.")
+
+                # CW111 : image sans empreinte ni version précise (« :latest », pas d'étiquette)
+                image = containers.run_image(exe, args)
+                reference = containers.parse_reference(image) if image else None
+                problem = containers.pinning_problem(reference) if reference else None
+                if image and problem:
+                    # L'image a passé la grammaire officielle : ASCII, sans espace ni contrôle.
+                    add(
+                        UNPINNED_CONTAINER_IMAGE,
+                        f"Server '{name}' runs the container image "
+                        f"'{commands.shorten(image, 100)}' {problem}.",
+                    )
+
+            # CW104 : accès disque trop large (serveur "filesystem")
+            if any("filesystem" in a.lower() for a in args):
+                for arg in args:
+                    if _is_broad_path(arg):
+                        add(BROAD_FILESYSTEM, f"Server '{name}' exposes '{arg}' to the AI agent.")
 
         # CW103 : secrets passés sur la ligne de commande (visibles aussi dans `ps`)
         for description in _command_line_secrets(launch.words):
@@ -1085,17 +1132,6 @@ def _check_server(name: str, server: dict, line: int, path: str) -> list[Finding
         # CW110 : vérification TLS coupée par une option (--insecure, --strict-ssl=false…)
         for flag in _tls_disabled_by_options(launch.words):
             add(INSECURE_TLS, f"Server '{name}' turns off TLS certificate checks ({flag}).")
-
-        # CW106 : conteneur qui casse son isolation
-        if exe in _CONTAINER_ENGINES:
-            for issue in _container_issues(args):
-                add(DANGEROUS_CONTAINER, f"Server '{name}' runs a container with {issue}.")
-
-        # CW104 : accès disque trop large (serveur "filesystem")
-        if any("filesystem" in a.lower() for a in args):
-            for arg in args:
-                if _is_broad_path(arg):
-                    add(BROAD_FILESYSTEM, f"Server '{name}' exposes '{arg}' to the AI agent.")
 
     # CW103 : secrets en dur dans env / headers ; CW110 : vérification TLS coupée (env)
     for block_name in ("env", "headers"):

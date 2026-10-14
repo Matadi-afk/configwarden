@@ -79,7 +79,7 @@ pytest
 configwarden scan examples/vulnerable-mcp
 configwarden scan examples/safe-mcp
 ```
-✅ **Vérification :** une ligne `… passed` sans aucun `failed` (572 tests en version 0.3.0) ; 14 problèmes sur l'exemple vulnérable ; `No issues found.` sur l'exemple sécurisé.
+✅ **Vérification :** une ligne `… passed` sans aucun `failed` (747 tests au 14 octobre 2026) ; 15 problèmes sur l'exemple vulnérable ; `No issues found.` sur l'exemple sécurisé.
 
 **Astuce VS Code :** l'onglet *Testing* (icône en forme de fiole) liste et lance les tests. Avec `F5`, tu lances l'outil en mode débogage et tu peux poser des points d'arrêt.
 

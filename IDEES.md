@@ -53,10 +53,10 @@ Le parking à idées. Une idée qui ne sert pas la phrase du projet atterrit ici
   (`.claude/agents/*.md`) et Kiro (`.kiro/agents/*.md`).
 
 ## Grand test sur 3 099 exemples publiés et contre-vérification (8 octobre 2026)
-- **Image Docker non figée** (règle à créer) : 110 exemples Docker sur 112 lancent une image
-  sans étiquette ni empreinte (`image` ou `image:latest`), l'équivalent de CW102 pour Docker.
-- **Toutes les commandes d'un script** : seule la 1re commande de `bash -c "cd x && npx …"` est
-  vérifiée (CW101 signale déjà le script ; 4 exemples cachent un `npx` non figé plus loin).
+- ~~**Image Docker non figée**~~ : fait le 14 octobre 2026 (règle CW111, 85 lignes `docker run`
+  sur 110 ; les 25 autres lancent une image officielle ou construite sur place).
+- ~~**Toutes les commandes d'un script**~~ : fait le 14 octobre 2026 (3 `npx` non figés et
+  1 `docker run` trouvés plus loin dans un script).
 - **CW102 pour `--with`** : les paquets ajoutés par `uvx --with` / `uv run --with` ne sont
   vérifiés que pour leur source (CW107), pas pour leur version.
 - **CW108 et outils en lecture seule** : 9 listes `alwaysAllow` sur 12 ne contiennent que des
@@ -70,6 +70,21 @@ Le parking à idées. Une idée qui ne sert pas la phrase du projet atterrit ici
 - **`npm init` / `pnpm create`** : téléchargent et lancent un paquet, rares pour MCP.
 - **Restes « bas » de l'Auditeur** : `--session dev01` encore pris pour un secret ;
   `${env:A}littéral${env:B}` lu comme une référence (motif `.+` trop gourmand, antérieur à 0.3.0).
+
+## Règle CW111 (14 octobre 2026)
+- **CW106 sur toute la ligne** : les options dangereuses sont cherchées partout, même dans les
+  arguments passés au conteneur (`docker run img --privileged`). `containers.run_image` sait
+  où s'arrêtent les options de `run` : l'utiliser aussi pour CW106.
+- **Images officielles de Docker Hub** (`node`, `python`) non signalées : seul Docker peut y
+  publier. À revoir si des utilisateurs le demandent.
+- **`docker compose run`** : l'image est dans `docker-compose.yml` (YAML, hors périmètre sans
+  dépendance).
+- **`major.minor`** (`:1.0`) accepté comme version précise : il suit pourtant les correctifs
+  dans beaucoup d'images. Une gravité basse pour ce cas ?
+- **CW103 et CW110 dans un script** : les mots d'un `bash -c "…"` ne sont pas encore
+  examinés pour les secrets (`--api-key …`) ni pour `--insecure`, seulement les programmes.
+- **Fin de ligne dans `command`** : `"cd x\nnpx …"` écrit dans `command` n'est pas découpé
+  (sans shell, le client chercherait un programme de ce nom).
 
 ## Nouvelles idées
 -

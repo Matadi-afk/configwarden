@@ -15,16 +15,22 @@ Au passage, on relève ce qui permet d'exécuter n'importe quoi (règle CW101) :
 - toute une ligne de commande avec des opérateurs shell écrite dans "command" ;
 - du code écrit dans la configuration (`node -e`, `python -c`…).
 
+Toutes les commandes d'un script sont suivies (`cd x && npx …`), pas seulement la 1re :
+séparateurs ; && || | & ( ) et fin de ligne ; le mot qui suit une redirection (`> f`)
+est un fichier ; `VAR=1`, `exec`, `then`, `do`… en tête de commande sont passés.
+
 Sécurité : chaque étape consomme au moins un mot, donc l'analyse se termine
 toujours, en temps linéaire, même avec des milliers d'enveloppes. Un script n'est
 découpé que sur ses 10 000 premiers caractères, au plus 5 fois (imbrication), et
-`env -S` au plus 20 fois : au-delà, l'empilement lui-même est signalé.
+`env -S` au plus 20 fois : au-delà, l'empilement lui-même est signalé. Au plus 20
+commandes sont suivies en plus de la 1re, toutes imbrications confondues.
 """
 
 from __future__ import annotations
 
 import re
 import shlex
+from collections import deque
 from dataclasses import dataclass, field
 
 _WINDOWS_SUFFIXES = (".exe", ".cmd", ".bat", ".com")
@@ -41,6 +47,7 @@ _WRAPPER_OPTIONS_WITH_VALUE: dict[str, set[str]] = {
     "time": set(),
     "setsid": set(),
     "busybox": set(),  # « busybox sh -c … » : l'applet est le vrai programme
+    "exec": {"-a"},  # « cd x && exec npx … » dans un script
 }
 # WSL sans -e/--exec passe la commande au shell Linux par défaut (revue du 8 octobre 2026).
 _WSL_EXEC_FLAGS = {"-e", "--exec"}
@@ -254,6 +261,14 @@ _SCRIPT_LIMIT = 10_000
 _MAX_SCRIPTS = 5
 _MAX_SPLITS = 20
 _MAX_WORDS = 200
+# Commandes vérifiées en plus de la 1re (« cd x && npx … ; uvx … »), par serveur.
+_MAX_COMMANDS = 20
+# En tête d'une commande de script, ces mots ne lancent rien : on passe au suivant.
+_SCRIPT_KEYWORDS = {"!", "{", "if", "then", "else", "elif", "do", "while", "until"}
+_ASSIGNMENT_WORD = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=")
+_WINDOWS_WORD = re.compile(r'"[^"]*"|[&|<>]+|[^\s"&|<>]+')
+_POWERSHELL_WORD = re.compile(r'"[^"]*"|[&|<>;]+|[^\s"&|<>;]+')
+_FALLBACK_WORD = re.compile(r"[;&|()<>]+|[^\s;&|()<>]+")
 
 
 @dataclass
@@ -266,6 +281,8 @@ class Launch:
     sources: list[str] = field(default_factory=list)
     # Toute la ligne de commande écrite dans la configuration (enveloppes comprises).
     words: list[str] = field(default_factory=list)
+    # Commandes suivantes d'un script (« bash -c "cd x && npx …" »), enveloppes retirées.
+    others: list[list[str]] = field(default_factory=list)
 
     @property
     def executable(self) -> str:
@@ -274,6 +291,11 @@ class Launch:
     @property
     def args(self) -> list[str]:
         return self.tokens[1:]
+
+    @property
+    def commands(self) -> list[list[str]]:
+        """Toutes les commandes lancées : la 1re, puis celles qui la suivent dans un script."""
+        return [command for command in (self.tokens, *self.others) if command]
 
 
 def shorten(text: str, limit: int = 60) -> str:
@@ -578,38 +600,54 @@ def _shell_metacharacters_from(tokens: list[str]) -> list[bool]:
     return flags
 
 
-def _first_command(words: list[str]) -> list[str]:
-    """Mots de la 1re commande d'un script (jusqu'au premier opérateur ; & | …)."""
-    result: list[str] = []
+def _split_commands(words: list[str]) -> list[list[str]]:
+    """Commandes d'une suite de mots, séparées par ; && || | & ( ) (au plus 1 + 20).
+
+    Après une redirection (« > fichier », « 2>&1 », « < entrée »), le mot suivant est un
+    fichier, pas le début d'une commande.
+    """
+    found: list[list[str]] = []
+    current: list[str] = []
+    skip_file = False
     for word in words:
-        if word and set(word) <= _SHELL_OPERATORS:
-            break
-        result.append(word.strip("'\""))
-        if len(result) >= _MAX_WORDS:
-            break
-    return result
+        if skip_file:
+            skip_file = False
+        elif word and set(word) <= _SHELL_OPERATORS:
+            if "<" in word or ">" in word:
+                skip_file = True
+            elif current:
+                found.append(current)
+                current = []
+                if len(found) > _MAX_COMMANDS:
+                    return found
+        elif len(current) < _MAX_WORDS:
+            current.append(word.strip("'\""))
+    if current:
+        found.append(current)
+    return found
 
 
-def _split_posix(script: str) -> list[str]:
-    script = script[:_SCRIPT_LIMIT]
+def _split_posix(script: str) -> list[list[str]]:
+    # Une fin de ligne sépare deux commandes, comme « ; » (shlex n'y voit qu'un espace).
+    # Le « ; » est placé APRÈS elle, pour qu'un commentaire « # … » s'arrête bien là ;
+    # une ligne continuée (barre oblique inverse en fin de ligne) reste une commande.
+    script = script[:_SCRIPT_LIMIT].replace("\\\n", " ").replace("\n", "\n;")
     try:
         lexer = shlex.shlex(script, posix=True, punctuation_chars=True)
         lexer.whitespace_split = True
-        words: list[str] = []
-        for word in lexer:
-            words.append(word)
-            if len(words) > _MAX_WORDS or (word and set(word) <= _SHELL_OPERATORS):
-                break
-        return _first_command(words)
+        return _split_commands(list(lexer))
     except ValueError:
         # Guillemet jamais fermé : découpage simple, sans planter.
-        return _first_command(re.split(r"[;&|]", script, maxsplit=1)[0].split())
+        return _split_commands(_FALLBACK_WORD.findall(script))
 
 
-def _split_windows(text: str) -> list[str]:
+def _split_windows(text: str, *, powershell: bool = False) -> list[list[str]]:
+    """Commandes d'une ligne cmd (& && || |) ou PowerShell (et « ; »)."""
     text = text[:_SCRIPT_LIMIT]
-    words = re.findall(r'"[^"]*"|[&|<>]+|[^\s"&|<>]+', text)
-    return _first_command(words[: _MAX_WORDS + 1])
+    if powershell:
+        text = text.replace("\n", ";")  # une instruction par ligne
+        return _split_commands(_POWERSHELL_WORD.findall(text))
+    return _split_commands(_WINDOWS_WORD.findall(text))
 
 
 def _split_words(text: str) -> list[str]:
@@ -629,25 +667,28 @@ def _split_words(text: str) -> list[str]:
         return text.split()[:_MAX_WORDS]
 
 
-def _command_words(command: str) -> tuple[list[str], bool]:
-    """« npx -y paquet » écrit tout entier dans "command" : (mots, opérateurs shell ?).
+def _command_words(command: str) -> tuple[list[str], bool, list[list[str]]]:
+    """« npx -y paquet » écrit tout entier dans "command".
 
-    Un chemin avec des espaces (« C:\\Program Files\\…\\npx.cmd ») reste un seul mot :
-    on ne découpe que si le premier mot est un programme connu.
+    Renvoie (mots de la 1re commande, opérateurs shell ?, commandes suivantes). Un chemin
+    avec des espaces (« C:\\Program Files\\…\\npx.cmd ») reste un seul mot : on ne
+    découpe que si le premier mot est un programme connu. Les commandes qui suivent un
+    opérateur (« cd x && npx … ») sont toujours renvoyées, pour être vérifiées aussi.
     """
     stripped = command.strip()
     if not any(char.isspace() for char in stripped):
-        return [command], False
+        return [command], False, []
     # « <path-to-npx> » ou « ?key=<your-api-key> » : des modèles à remplir, pas des
     # redirections. On les retire avant de chercher les opérateurs.
     without_placeholders = _ANGLE_PLACEHOLDER.sub("", stripped[:_SCRIPT_LIMIT])
     operators = bool(_COMMAND_LINE_OPERATORS & set(without_placeholders)) or (
         "$(" in without_placeholders
     )
-    words = _split_windows(stripped) if "\\" in stripped else _split_posix(stripped)
-    if words and _is_known_program(executable_name(words[0])):
-        return words, operators
-    return [command], operators
+    found = _split_windows(stripped) if "\\" in stripped else _split_posix(stripped)
+    rest = found[1:] if operators else []
+    if found and _is_known_program(executable_name(found[0][0])):
+        return found[0], operators, rest
+    return [command], operators, rest
 
 
 def _metacharacters_from(tokens: list[str]) -> list[bool]:
@@ -662,34 +703,75 @@ def _metacharacters_from(tokens: list[str]) -> list[bool]:
     return flags
 
 
+@dataclass
+class _Work:
+    """État partagé par toutes les commandes d'un serveur : constats et limites."""
+
+    risks: list[str] = field(default_factory=list)
+    sources: list[str] = field(default_factory=list)
+    pending: deque[list[str]] = field(default_factory=deque)
+    queued: int = 0
+    scripts: int = 0
+    splits: int = 0
+
+    def first_of(self, found: list[list[str]]) -> list[str]:
+        """1re commande d'un script ; les suivantes attendent leur tour (20 au plus)."""
+        for command in found[1:]:
+            if self.queued >= _MAX_COMMANDS:
+                break
+            self.queued += 1
+            self.pending.append(command)
+        return found[0] if found else []
+
+
 def analyse(command: str, args: list[str]) -> Launch:
-    """Retire les enveloppes et relève les risques CW101 d'une ligne de commande."""
-    words, operators = _command_words(command)
+    """Retire les enveloppes et relève les risques CW101 d'une ligne de commande.
+
+    Toutes les commandes d'un script sont suivies (« bash -c "cd x && npx …" ») : la
+    1re dans `tokens`, les suivantes dans `others`. Les limites sont communes à toutes
+    les commandes d'un serveur, imbrication comprise : le travail reste borné.
+    """
+    words, operators, rest = _command_words(command)
     tokens = [*words, *args]
-    original = list(tokens)
-    risks: list[str] = []
+    work = _Work()
     if operators:
-        risks.append("passes a command line with shell operators in 'command'")
-    sources: list[str] = []
+        work.risks.append("passes a command line with shell operators in 'command'")
+    work.first_of([[], *rest])  # commandes qui suivent un opérateur dans "command"
+    first = _unwrap(tokens, work)
+    others: list[list[str]] = []
+    while work.pending:
+        unwrapped = _unwrap(work.pending.popleft(), work)
+        if unwrapped:
+            others.append(unwrapped)
+    return Launch(
+        tokens=first, risks=work.risks, sources=work.sources, words=list(tokens), others=others
+    )
+
+
+def _unwrap(tokens: list[str], work: _Work) -> list[str]:
+    """Retire les enveloppes d'UNE commande ; renvoie le programme et ses arguments."""
+    risks = work.risks
+    sources = work.sources
     start = 0
-    scripts = 0
-    splits = 0
     label = ""  # nom écrit par l'utilisateur quand un lanceur a été ramené à npx / uvx
     metacharacters: list[bool] | None = None
     # (liste analysée, drapeaux) : la liste est gardée pour savoir si le calcul est à jour.
     shell_meta: tuple[list[str], list[bool]] | None = None
     while start < len(tokens):
+        if _ASSIGNMENT_WORD.match(tokens[start]) or tokens[start] in _SCRIPT_KEYWORDS:
+            start += 1  # « FOO=1 npx … », « then npx … » : rien n'est lancé par ce mot
+            continue
         executable = executable_name(tokens[start])
         if executable == "env":
             position, split = _after_env(tokens, start + 1)
             if split is None:
                 start = position
                 continue
-            if splits >= _MAX_SPLITS:
+            if work.splits >= _MAX_SPLITS:
                 risks.append("executes commands through deeply nested 'env -S'")
                 tokens, start = [], 0
                 break
-            splits += 1
+            work.splits += 1
             begin, end, prefix, text = split
             tokens = (
                 tokens[:begin] + ([prefix] if prefix else []) + _split_words(text) + tokens[end:]
@@ -723,11 +805,11 @@ def analyse(command: str, args: list[str]) -> Launch:
             if kind != "script":
                 break
             risks.append(f"executes commands through '{shorten(executable)} {shorten(flag)}'")
-            if scripts >= _MAX_SCRIPTS:
+            if work.scripts >= _MAX_SCRIPTS:
                 tokens, start = [], 0
                 break
-            scripts += 1
-            tokens, start, metacharacters = _split_posix(script), 0, None
+            work.scripts += 1
+            tokens, start, metacharacters = work.first_of(_split_posix(script)), 0, None
             continue
         if executable == "deno" and start + 1 < len(tokens) and tokens[start + 1] in {"run", "x"}:
             subcommand = tokens[start + 1]
@@ -802,9 +884,10 @@ def analyse(command: str, args: list[str]) -> Launch:
                 metacharacters = _metacharacters_from(tokens)
             if single_text or metacharacters[inner_start]:
                 risks.append(f"executes a command line through 'cmd {shorten(flag)}'")
-            if single_text and scripts < _MAX_SCRIPTS:
-                scripts += 1
-                tokens, start, metacharacters = _split_windows(tokens[inner_start]), 0, None
+            if single_text and work.scripts < _MAX_SCRIPTS:
+                work.scripts += 1
+                tokens = work.first_of(_split_windows(tokens[inner_start]))
+                start, metacharacters = 0, None
             else:
                 start = inner_start
             continue
@@ -814,11 +897,11 @@ def analyse(command: str, args: list[str]) -> Launch:
                 break
             flag, script = found_script
             risks.append(f"executes commands through '{shorten(executable)} {shorten(flag)}'")
-            if scripts >= _MAX_SCRIPTS:
+            if work.scripts >= _MAX_SCRIPTS:
                 tokens, start = [], 0
                 break
-            scripts += 1
-            tokens, start, metacharacters = _split_posix(script), 0, None
+            work.scripts += 1
+            tokens, start, metacharacters = work.first_of(_split_posix(script)), 0, None
             continue
         if executable in _POWERSHELLS:
             found_ps = _powershell_command(tokens, start + 1)
@@ -832,11 +915,12 @@ def analyse(command: str, args: list[str]) -> Launch:
                 tokens, start = [], 0
                 break
             risks.append(f"executes commands through '{shorten(executable)} {shorten(flag)}'")
-            if scripts >= _MAX_SCRIPTS:
+            if work.scripts >= _MAX_SCRIPTS:
                 tokens, start = [], 0
                 break
-            scripts += 1
-            tokens, start, metacharacters = _split_windows(script), 0, None
+            work.scripts += 1
+            tokens = work.first_of(_split_windows(script, powershell=True))
+            start, metacharacters = 0, None
             continue
         interpreter = _interpreter(executable)
         if interpreter is not None:
@@ -846,4 +930,4 @@ def analyse(command: str, args: list[str]) -> Launch:
         elif executable == "deno" and start + 1 < len(tokens) and tokens[start + 1] == "eval":
             risks.append("executes inline code ('deno eval')")
         break
-    return Launch(tokens=tokens[start:], risks=risks, sources=sources, words=original)
+    return tokens[start:]
