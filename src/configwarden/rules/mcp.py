@@ -29,6 +29,7 @@ from urllib.parse import unquote, urlparse
 
 from configwarden import commands, containers, jsonc, values
 from configwarden.models import Finding, Rule, Severity
+from configwarden.npm_args import parse_npx
 from configwarden.redact import redact, redact_url, url_origin
 
 # --- Définition des règles -----------------------------------------------------
@@ -220,9 +221,8 @@ _URL_KEYS = ("url", "serverUrl", "httpUrl")
 # commands.analyse(). « pipx run » garde son nom : ses options lui sont propres.
 _PACKAGE_RUNNERS = {"npx", "pnpx", "bunx", "uvx", "pipx run"}
 _PYTHON_RUNNERS = {"uvx", "pipx run"}
-# Options dont la valeur désigne le paquet lancé (« -p » est --package pour npx,
-# mais --python pour uvx).
-_NPM_PACKAGE_FLAGS = {"--package", "-p"}
+# Options dont la valeur désigne le paquet lancé (« -p » est --python pour uvx). npx,
+# pnpm dlx et bunx sont lus exactement comme npm les lit : voir npm_args.py.
 _UV_PACKAGE_FLAGS = {"--from"}
 _PIPX_PACKAGE_FLAGS = {"--spec"}
 _PIPX_OPTIONS_WITH_VALUE = {"--spec", "--python", "--index-url", "-i", "--pip-args", "--backend"}
@@ -231,24 +231,21 @@ _PIPX_OPTIONS_WITH_VALUE = {"--spec", "--python", "--index-url", "-i", "--pip-ar
 _LOCAL_PATH = re.compile(r"\.{1,2}(?:[\\/]|$)|~[\\/]|/|[A-Za-z]:[\\/]|file:", re.IGNORECASE)
 # uvx : paquets installés EN PLUS du serveur (leur code s'exécute aussi).
 _EXTRA_PACKAGE_FLAGS = {"--with", "--with-editable"}
-# Options suivies d'une valeur, PAR LANCEUR : « -f » vaut --force (sans valeur)
-# pour npx mais --find-links (avec valeur) pour uvx. Sans ces listes, la valeur
-# d'une option (« --registry https://… ») serait prise pour le paquet, et une
-# option sans valeur (« -f ») ferait sauter le vrai paquet. Une option inconnue
-# est supposée SANS valeur (cas de « -y »).
-_NPM_OPTIONS_WITH_VALUE = {
-    "--package",
-    "-p",
-    "--call",
-    "-c",
-    "--registry",
-    "--cache",
-    "--userconfig",
-    "--prefix",
-    "--loglevel",
-    "--workspace",
-    "-w",
-}
+_NPM_LIKE_RUNNERS = {"npx", "pnpx", "bunx"}
+# Variable d'environnement lue par npm (npx, npm exec) : une ligne lancée dans un shell.
+_NPM_CONFIG_CALL_KEY = re.compile(r"npm_config_call", re.IGNORECASE)
+# uv sépare les paquets de « --with a,b » sur les virgules, sauf entre crochets (extras :
+# « pkg[a,b] ») et sauf devant un opérateur de version (plage : « pkg>=1,<2 »). Vérifié
+# avec uv 0.11 le 20 octobre 2026.
+_VERSION_OPERATORS = frozenset("!=<>~")
+_NEXT_CHARACTER = re.compile(r"\s*(\S)")
+# Python : les « extras » de PEP 508 (« mcp[cli] », « psycopg[binary,pool] ») suivent un
+# nom ; un modèle à remplir (« [VOTRE PAQUET] ») commence, lui, par le crochet.
+_PYTHON_EXTRAS = re.compile(r"(?<=[A-Za-z0-9])\[[A-Za-z0-9._,\s-]{1,128}\]")
+# Options d'uvx suivies d'une valeur (« -f » y est --find-links). Sans cette liste, la
+# valeur d'une option (« --index-url https://… ») serait prise pour le paquet, et une
+# option sans valeur ferait sauter le vrai paquet. Une option inconnue est supposée SANS
+# valeur. npx n'a plus besoin de liste : il est lu comme npm le lit (npm_args.py).
 _UV_OPTIONS_WITH_VALUE = {
     "--from",
     "--with",
@@ -403,6 +400,8 @@ _LOCAL_HOSTS = {"localhost", "127.0.0.1", "::1", "0.0.0.0"}  # noqa: S104 (liste
 
 # CW106 : moteurs de conteneurs et options qui cassent l'isolation.
 _CONTAINER_ENGINES = {"docker", "podman", "nerdctl"}
+# Valeurs « vrai » d'un booléen pour Docker, Podman et nerdctl (strconv.ParseBool de Go).
+_PFLAG_TRUE = {"1", "t", "T", "TRUE", "true", "True"}
 _HOST_NAMESPACE_FLAGS = {"--network", "--net", "--pid", "--ipc", "--uts", "--userns"}
 _MOUNT_FLAGS = {"-v", "--volume"}
 _DANGEROUS_CAPABILITIES = {"ALL", "SYS_ADMIN", "SYS_PTRACE", "SYS_MODULE", "NET_ADMIN"}
@@ -921,40 +920,49 @@ def _is_sensitive_mount(source: str) -> bool:
     )
 
 
-def _container_issues(args: list[str]) -> list[str]:
-    """Liste lisible des options dangereuses d'un « docker run » / « podman run »."""
-    if "run" not in args:
-        return []
+def _container_issues(pairs: list[containers.Pair]) -> list[str]:
+    """Liste lisible des options dangereuses d'un « docker run » / « podman run ».
+
+    `pairs` : les options lues par containers.run_option_pairs (ou loose_option_pairs).
+    """
     issues: list[str] = []
-    if "--privileged" in args or "--privileged=true" in args:
+    if any(name == "--privileged" and value in _PFLAG_TRUE for name, value in pairs):
         issues.append("--privileged")
-    for flag_value in _option_values(args, _HOST_NAMESPACE_FLAGS):
-        if flag_value == "host":
-            issues.append("a host namespace (=host)")
-            break
-    for spec in _option_values(args, _MOUNT_FLAGS | {"--mount"}):
-        source = _mount_source(spec)
-        if source and _is_sensitive_mount(source):
-            issues.append(f"a mount of '{source}'")
-    for capability in _option_values(args, {"--cap-add"}):
-        if capability.upper().removeprefix("CAP_") in _DANGEROUS_CAPABILITIES:
-            issues.append(f"--cap-add {capability}")
-    for option in _option_values(args, {"--security-opt"}):
-        if option.endswith("=unconfined") or option.endswith(":unconfined"):
-            issues.append(f"--security-opt {option}")
+    if any(name in _HOST_NAMESPACE_FLAGS and value == "host" for name, value in pairs):
+        issues.append("a host namespace (=host)")
+    for name, value in pairs:
+        if name in _MOUNT_FLAGS or name == "--mount":
+            source = _mount_source(value)
+            if source and _is_sensitive_mount(source):
+                issues.append(f"a mount of '{source}'")
+    for name, value in pairs:
+        if name == "--cap-add" and value.upper().removeprefix("CAP_") in _DANGEROUS_CAPABILITIES:
+            issues.append(f"--cap-add {value}")
+    for name, value in pairs:
+        if name == "--security-opt" and value.endswith(("=unconfined", ":unconfined")):
+            issues.append(f"--security-opt {value}")
     return issues
 
 
 def _package_flags(runner: str) -> set[str]:
-    if runner == "pipx run":
-        return _PIPX_PACKAGE_FLAGS
-    return _UV_PACKAGE_FLAGS if runner == "uvx" else _NPM_PACKAGE_FLAGS
+    """uvx et pipx run (npx est lu par _npm_reading)."""
+    return _PIPX_PACKAGE_FLAGS if runner == "pipx run" else _UV_PACKAGE_FLAGS
 
 
 def _options_with_value(runner: str) -> set[str]:
-    if runner == "pipx run":
-        return _PIPX_OPTIONS_WITH_VALUE
-    return _UV_OPTIONS_WITH_VALUE if runner == "uvx" else _NPM_OPTIONS_WITH_VALUE
+    """uvx et pipx run (npx est lu par _npm_reading)."""
+    return _PIPX_OPTIONS_WITH_VALUE if runner == "pipx run" else _UV_OPTIONS_WITH_VALUE
+
+
+def _npm_reading(args: list[str]) -> tuple[list[str], list[str]]:
+    """(valeurs de --package, commande lancée) d'un `npx …`, lus exactement comme npm 10.
+
+    `pnpm dlx` et `bunx` sont lus de la même façon (voir npm_args.py). En mode shell
+    (`-c "…"`, `--call`, `--shell-mode`), la commande est une ligne de shell, déjà
+    signalée par CW101 : elle n'est pas lue comme un nom de paquet.
+    """
+    reading = parse_npx(args)
+    return reading.packages, ([] if reading.shell_option() else reading.command)
 
 
 def _is_local_path(package: str) -> bool:
@@ -976,8 +984,15 @@ def _first_positional(runner: str, args: list[str]) -> str | None:
 
 
 def _package_spec(runner: str, args: list[str]) -> str | None:
-    """Le paquet lancé : valeur de --from / --package / -p, sinon 1er argument."""
-    explicit = _option_values(args, _package_flags(runner))
+    """Le paquet lancé : valeur de --from / --package / -p, sinon 1er argument.
+
+    Seules les options placées AVANT le paquet sont celles du lanceur : dans
+    « npx srv@1.2.3 -p 3000 », « -p 3000 » est donné au serveur (revue du 20 octobre).
+    """
+    if runner in _NPM_LIKE_RUNNERS:
+        packages, command = _npm_reading(args)
+        return packages[0] if packages else (command[0] if command else None)
+    explicit = _option_values(_options_before_package(runner, args), _package_flags(runner))
     return explicit[0] if explicit else _first_positional(runner, args)
 
 
@@ -988,10 +1003,15 @@ def _untrusted_source(runner: str, args: list[str]) -> str | None:
     un serveur « fetch » peut légitimement recevoir une URL. Un registre privé
     (--registry, --index-url) n'est pas un paquet et n'est pas signalé ici.
     """
-    candidates = _option_values(args, _package_flags(runner) | _EXTRA_PACKAGE_FLAGS)
-    first = _first_positional(runner, args)
-    if first:
-        candidates.append(first)
+    if runner in _NPM_LIKE_RUNNERS:
+        packages, command = _npm_reading(args)
+        candidates = [*packages, *command[:1]]
+    else:
+        options = _options_before_package(runner, args)
+        candidates = _option_values(options, _package_flags(runner) | _EXTRA_PACKAGE_FLAGS)
+        first = _first_positional(runner, args)
+        if first:
+            candidates.append(first)
     for value in candidates:
         source = _source_outside_registry(runner, value)
         if source:
@@ -1015,6 +1035,66 @@ def _source_outside_registry(runner: str, value: str) -> str | None:
     return None
 
 
+def _options_before_package(runner: str, args: list[str]) -> list[str]:
+    """Les options du lanceur : ce qui précède le paquet (après, ce sont celles du serveur)."""
+    with_value = _options_with_value(runner)
+    index = 0
+    while index < len(args):
+        arg = args[index]
+        if arg == "--":
+            break
+        if arg.split("=", 1)[0] in with_value and "=" not in arg:
+            index += 2
+        elif arg.startswith("-"):
+            index += 1
+        else:
+            break
+    return args[:index]
+
+
+def _split_requirements(value: str) -> list[str]:
+    """Comme uv : « a==1,b » -> ['a==1', 'b'] ; « pkg>=1,<2 » et « pkg[a,b] » restent entiers."""
+    parts: list[str] = []
+    depth = start = 0
+    for index, character in enumerate(value):
+        if character == "[":
+            depth += 1
+        elif character == "]":
+            depth = max(0, depth - 1)
+        elif character == "," and depth == 0:
+            following = _NEXT_CHARACTER.match(value, index + 1)
+            if following and following.group(1) in _VERSION_OPERATORS:
+                continue  # « >=1,<2 » : une seule plage de versions
+            parts.append(value[start:index])
+            start = index + 1
+    parts.append(value[start:])
+    return [part.strip() for part in parts if part.strip()]
+
+
+def _extra_packages(runner: str, args: list[str]) -> list[str]:
+    """Paquets installés en plus du serveur : `uvx --with`, et `npx -p` après le 1er."""
+    if runner == "uvx":
+        values = _option_values(_options_before_package(runner, args), {"--with"})
+    elif runner in _NPM_LIKE_RUNNERS:
+        values = _npm_reading(args)[0][1:]
+    else:
+        return []
+    return [package for value in values for package in _split_requirements(value)]
+
+
+def _is_unpinned_registry_package(runner: str, package: str) -> bool:
+    """Paquet du registre sans version exacte (un chemin local ou une URL ne compte pas)."""
+    if not package or _is_local_path(package) or package.lower().endswith(".whl"):
+        return False
+    # « mcp[cli] » est un vrai paquet : ses extras ne doivent pas passer pour un modèle.
+    name = _PYTHON_EXTRAS.sub("", package, count=1) if runner in _PYTHON_RUNNERS else package
+    if "$" in package or values.is_placeholder(name):
+        return False  # variable (« ${DB_DRIVER} ») ou modèle à remplir : rien à figer ici
+    if _source_outside_registry(runner, package) is not None:
+        return False  # source non vérifiée : déjà signalée par CW107
+    return not _package_is_pinned(runner, package)
+
+
 def _http_host(url: str) -> str | None:
     """Hôte d'une URL en http:// ('' si illisible), ou None si l'URL n'est pas en http://."""
     url = url.strip()
@@ -1035,6 +1115,23 @@ def _check_server(name: str, server: dict, line: int, path: str) -> list[Finding
     args = [a for a in raw_args if isinstance(a, str)] if isinstance(raw_args, list) else []
 
     reported: set[tuple[str, str]] = set()
+    env_block = server.get("env")
+    # « npm_config_call » : npm (npx, npm exec, et tout npm lancé par le serveur) exécute
+    # cette ligne dans un shell, comme « npx -c ». Une valeur vide est ignorée par npm.
+    npm_call_key = (
+        next(
+            (
+                str(key)
+                for key, value in env_block.items()
+                if _NPM_CONFIG_CALL_KEY.fullmatch(str(key))
+                and isinstance(value, str)
+                and value.strip()
+            ),
+            None,
+        )
+        if isinstance(env_block, dict)
+        else None
+    )
 
     def add(rule: Rule, message: str) -> None:
         # Une seule fois par message : 70 000 « --insecure » ne font pas 70 000 alertes.
@@ -1049,8 +1146,21 @@ def _check_server(name: str, server: dict, line: int, path: str) -> list[Finding
         launch = commands.analyse(command, args)
 
         # CW101 : shell, ligne de commande ou code en ligne (une seule alerte par serveur)
-        if launch.risks:
-            add(SHELL_EXECUTION, f"Server '{name}' {launch.risks[0]}.")
+        risks = launch.risks or (
+            [f"executes a command line through 'npm_config_call' (env.{npm_call_key})"]
+            if npm_call_key
+            else []
+        )
+        if risks:
+            add(SHELL_EXECUTION, f"Server '{name}' {risks[0]}.")
+
+        # CW100 : script trop long ou trop imbriqué ; ce qui suit n'a pas été lu.
+        if launch.truncated:
+            add(
+                INVALID_CONFIG,
+                f"Server '{name}' chains too many commands or nested scripts: they could not "
+                "all be checked.",
+            )
 
         # CW107 : paquets ajoutés par l'enveloppe (« uv run --with git+https://… »)
         for extra in launch.sources:
@@ -1062,6 +1172,15 @@ def _check_server(name: str, server: dict, line: int, path: str) -> list[Finding
                     "instead of a registry.",
                 )
                 break
+        # CW102 : paquets du registre ajoutés par l'enveloppe, sans version exacte
+        for extra in launch.sources:
+            for package in _split_requirements(extra):
+                if _is_unpinned_registry_package("uvx", package):
+                    add(
+                        UNPINNED_PACKAGE,
+                        f"Server '{name}' also installs '{redact_url(package)}' "
+                        "without a pinned version.",
+                    )
 
         # Chaque commande lancée : la 1re, puis celles qui la suivent dans un script
         # (« bash -c "cd x && npx …" »), enveloppes retirées.
@@ -1092,10 +1211,23 @@ def _check_server(name: str, server: dict, line: int, path: str) -> list[Finding
                             f"Server '{name}' runs '{redact_url(package)}' "
                             "without a pinned version.",
                         )
+                # CW102 : paquets installés en plus du serveur (--with, 2e « -p »)
+                for extra in _extra_packages(exe, args):
+                    if _is_unpinned_registry_package(exe, extra):
+                        add(
+                            UNPINNED_PACKAGE,
+                            f"Server '{name}' also installs '{redact_url(extra)}' "
+                            "without a pinned version.",
+                        )
 
-            # CW106 : conteneur qui casse son isolation
+            # CW106 : conteneur qui casse son isolation. Seules les options placées avant
+            # l'image comptent (après, ce sont les arguments du programme du conteneur) ;
+            # si la ligne est illisible, toute la ligne est vérifiée, par prudence.
             if exe in _CONTAINER_ENGINES:
-                for issue in _container_issues(args):
+                pairs = containers.run_option_pairs(exe, args)
+                if pairs is None:
+                    pairs = containers.loose_option_pairs(exe, args) if "run" in args else []
+                for issue in _container_issues(pairs):
                     add(DANGEROUS_CONTAINER, f"Server '{name}' runs a container with {issue}.")
 
                 # CW111 : image sans empreinte ni version précise (« :latest », pas d'étiquette)

@@ -9,7 +9,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "configwarden"
-version = "0.3.0"
+version = "0.4.0"
 description = "Security scanner for AI agent configurations (MCP servers, secrets, supply chain)."
 readme = "README.md"
 license = "Apache-2.0"
@@ -37,6 +37,9 @@ dev = [
     "ruff>=0.16",
     "pre-commit>=4.0",
     "pip-audit>=2.9",
+    # Tests de propriétés (« fuzzing ») : décision du 20 octobre 2026. Les versions
+    # 6.142 à 6.168 fonctionnent encore avec Python 3.10.
+    "hypothesis>=6.142",
 ]
 
 [project.scripts]
@@ -64,6 +67,8 @@ include = [
   "/SECURITY.md",
   "/LICENSE",
   "/pyproject.toml",
+  "/action.yml",
+  "/.pre-commit-hooks.yaml",
 ]
 
 # -----------------------------------------------------------------------------

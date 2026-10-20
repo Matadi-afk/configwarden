@@ -12,7 +12,7 @@ import re
 
 from configwarden import values
 from configwarden.models import Finding, Rule, Severity
-from configwarden.redact import redact
+from configwarden.redact import redact, redact_url
 
 HARDCODED_SECRET = Rule(
     id="CW001",
@@ -49,6 +49,11 @@ _KEY_LOOKAHEAD_LINES = 6
 # ou les faire suivre de lignes d'un mégaoctet.
 _KEY_LOOKAHEAD_CHARS = 256
 _SHORT_LINE = 80
+# mask_secrets : un long mot de lettres, chiffres, « _ » ou « - » (un jeton inconnu). Le
+# début de mot est obligatoire et rien n'est imbriqué : temps linéaire.
+_GENERIC_TOKEN = re.compile(r"(?<![A-Za-z0-9_-])[A-Za-z0-9_-]{24,}")
+_HAS_LETTER = re.compile(r"[A-Za-z]")
+_HAS_DIGIT = re.compile(r"[0-9]")
 
 
 def _has_key_material(lines: list[str], index: int, end: int) -> bool:
@@ -81,6 +86,28 @@ def _is_real(label: str, secret: str, lines: list[str], index: int, end: int) ->
     if label == "Private key":
         return _has_key_material(lines, index, end)
     return True
+
+
+def _mask_generic(match: re.Match[str]) -> str:
+    word = match.group(0)
+    if _HAS_LETTER.search(word) and _HAS_DIGIT.search(word):
+        return redact(word)
+    return word  # « mcp-server-filesystem-demo » : que des lettres, pas un jeton
+
+
+def mask_secrets(text: str) -> str:
+    """Masque tout ce qui ressemble à un secret dans un texte libre (raison d'une exception).
+
+    Sont masqués : les identifiants d'une URL (« user:motdepasse@ », paramètres), les
+    clés et jetons aux formats connus, et tout long mot (24 caractères au moins) qui mêle
+    lettres et chiffres. En cas de doute, on masque : ce texte sera affiché dans les
+    rapports et les journaux de CI (revue de l'Auditeur du 20 octobre 2026).
+    """
+    text = redact_url(text)
+    for label, pattern in _PATTERNS:
+        if label != "Private key":  # l'en-tête seul n'est pas un secret
+            text = pattern.sub(lambda match: redact(match.group(0)), text)
+    return _GENERIC_TOKEN.sub(_mask_generic, text)
 
 
 def check_text(text: str, path: str) -> list[Finding]:

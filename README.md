@@ -19,7 +19,7 @@ AI agents (Claude, Cursor, VS Code Copilot…) are increasingly wired to tools t
 Requires Python 3.10+.
 
 ```bash
-pip install configwarden==0.3.0
+pip install configwarden==0.4.0
 configwarden scan .
 ```
 
@@ -52,13 +52,13 @@ Every value in `examples/` is a fake placeholder, and the example files are name
 | ID | Severity | What it detects |
 |----|----------|-----------------|
 | CW001 | critical | API keys and tokens written in clear (Anthropic, OpenAI, GitHub, AWS, Google, Hugging Face, Slack, Stripe, private keys); documentation examples (`…EXAMPLE`, `sk-xxxx`, truncated keys) are ignored |
-| CW100 | medium | MCP config that cannot be parsed (some clients still run the servers they can read from a broken file) |
-| CW101 | high | Shell running a script (`bash -c`, `pwsh -Command`, `su -c`), `cmd /c` or WSL with a command line or special characters, `npx -c`, a command line with shell operators in `command`, inline code (`node -e`, `python -c`) |
-| CW102 | medium | Registry package without an exact version (`^1.0`, `@beta`, `>=1` are not pinned), whatever the launcher: `npx`, `uvx`, `pnpm dlx`, `yarn dlx`, `bun x`, `npm exec`, `uv tool run`, `pipx run`, `deno run npm:` |
+| CW100 | medium | MCP config that cannot be parsed (some clients still run the servers they can read from a broken file), or a script too long to be checked entirely |
+| CW101 | high | Shell running a script (`bash -c`, `pwsh -Command`, `su -c`), `cmd /c` or WSL with a command line or special characters, `npx -c` and `npm exec -c` (read exactly as npm reads them), `pnpm -c dlx`, `npm_config_call`, a command line with shell operators in `command`, inline code (`node -e`, `python -c`) |
+| CW102 | medium | Registry package without an exact version (`^1.0`, `@beta`, `>=1` are not pinned), whatever the launcher: `npx`, `uvx`, `pnpm dlx`, `yarn dlx`, `bun x`, `npm exec`, `uv tool run`, `pipx run`, `deno run npm:`; extra packages too (`uvx --with`, `uv run --with`) |
 | CW103 | high | Secret written literally in an MCP server's `env`, `headers`, command line (`--api-key …`, `-e TOKEN=…`) or URL (password, `?token=…`); placeholders, references and plain settings are ignored |
 | CW104 | high | Filesystem server exposed to `/`, a whole drive or a whole home directory |
 | CW105 | high | Remote MCP server reached over plain `http://` |
-| CW106 | high | Docker/Podman server with `--privileged`, host namespaces, or mounts of `/`, the home directory, `.ssh`/`.aws`… or the Docker socket |
+| CW106 | high | Docker/Podman server started with `--privileged`, host namespaces, or mounts of `/`, the home directory, `.ssh`/`.aws`… or the Docker socket (options placed before the image, glued forms such as `-v/:/host` or `--privileged=1` included) |
 | CW107 | high | Package or script installed from git, a URL or a GitHub shorthand instead of the npm / PyPI registry (`uv run --with git+…`, `deno run https://…`…) |
 | CW108 | medium | Tools auto-approved (`alwaysAllow`, `autoApprove`, `trust: true`): no human confirmation |
 | CW109 | high | AI client set to approve everything: Claude Code `enableAllProjectMcpServers` or `bypassPermissions`, VS Code `chat.tools.global.autoApprove`, Zed, Cursor `*:*`, Kiro Autopilot |
@@ -90,11 +90,29 @@ Wrapped commands are unwrapped before being checked: `cmd /c npx …`, `wsl …`
 ```bash
 configwarden scan PATH [--format text|json|sarif] [--output FILE]
                      [--fail-on low|medium|high|critical] [--exclude GLOB]...
+                     [--no-ignore | --ignore-file FILE]
 ```
 
 Exit codes: `0` nothing at or above `--fail-on`, `1` findings, `2` usage error.
 
-### GitHub Actions
+### Accepting a finding: `.configwarden-ignore`
+
+Put a `.configwarden-ignore` file at the root of the scanned folder, one exception per line, always with a reason:
+
+```text
+# rule  file, or folder ending with /   [optional end date]   -- reason (required)
+CW106   examples/demo/mcp.json                                -- demo file, intentionally vulnerable
+CW111   .vscode/mcp.json               until=2026-12-31       -- vendor has no versioned image yet
+```
+
+- One rule per line and one file or folder: no wildcard, never the whole project.
+- After `until=`, the exception stops applying and the finding comes back.
+- A malformed line is reported (by its number, without copying its content) and ignored. So is a line containing a control or invisible character, even in a comment.
+- A secret pasted in a reason by mistake is masked in every report.
+- Suppressed findings no longer fail the scan, but they are **always listed** at the end of the text report and in the JSON report, with their reason: a repository cannot hide its own dangerous configuration without it showing. They are left out of SARIF reports, because GitHub Code Scanning ignores SARIF suppressions and would show them as open alerts.
+- `--no-ignore` reports everything. `--ignore-file FILE` reads exceptions from a file you trust instead (for example outside a repository you are reviewing). The project's own file is never read through a symbolic link.
+
+### GitHub Action
 
 ```yaml
 jobs:
@@ -102,21 +120,38 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      security-events: write   # needed to upload SARIF results
+      security-events: write   # only needed to upload SARIF results
     steps:
-      - uses: actions/checkout@v4   # pin actions to a commit SHA in production
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@<commit-sha>   # v7
         with:
-          python-version: "3.13"
-      - run: pip install configwarden==0.3.0
-      - run: configwarden scan . --format sarif --output configwarden.sarif
-      - uses: github/codeql-action/upload-sarif@v4
+          persist-credentials: false
+      - uses: Matadi-afk/configwarden@<commit-sha>   # v0.4.0
+        with:
+          fail-on: high                  # low (default), medium, high or critical
+          sarif-file: configwarden.sarif # optional
+          # exclude: |                   # optional, one glob per line
+          #   examples/*
+      - uses: github/codeql-action/upload-sarif@<commit-sha>   # v4
         if: always()
         with:
           sarif_file: configwarden.sarif
 ```
 
-Results then appear in the repository's **Security → Code scanning** tab.
+Pin every action to a full commit SHA (`git ls-remote https://github.com/Matadi-afk/configwarden refs/tags/v0.4.0` prints the one for v0.4.0). The action needs no token and no permission, installs nothing, and runs configwarden in isolated mode with the Python already installed on the runner (3.10 or later; add `actions/setup-python` before it otherwise), so the scanned repository cannot replace its code. Results then appear in the repository's **Security → Code scanning** tab.
+
+File and server names from the scanned repository cannot drive the runner either: under GitHub Actions the text report is printed with workflow commands stopped (`::stop-commands::` and a random token), and `##` sequences (`##[…]`, Azure's `##vso[…]`) are neutralised in every report format.
+
+### pre-commit
+
+```yaml
+repos:
+  - repo: https://github.com/Matadi-afk/configwarden
+    rev: <commit-sha>  # frozen: v0.4.0
+    hooks:
+      - id: configwarden
+```
+
+The hook runs on every commit and scans the whole repository: a dangerous MCP configuration or a secret, in any file, blocks the commit.
 
 ## Development
 

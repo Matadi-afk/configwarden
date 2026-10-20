@@ -57,12 +57,11 @@ Le parking à idées. Une idée qui ne sert pas la phrase du projet atterrit ici
   sur 110 ; les 25 autres lancent une image officielle ou construite sur place).
 - ~~**Toutes les commandes d'un script**~~ : fait le 14 octobre 2026 (3 `npx` non figés et
   1 `docker run` trouvés plus loin dans un script).
-- **CW102 pour `--with`** : les paquets ajoutés par `uvx --with` / `uv run --with` ne sont
-  vérifiés que pour leur source (CW107), pas pour leur version.
+- ~~**CW102 pour `--with`**~~ : fait le 20 octobre 2026 (17 alertes de plus sur le corpus).
 - **CW108 et outils en lecture seule** : 9 listes `alwaysAllow` sur 12 ne contiennent que des
   outils de lecture, que la règle tolère ; distinguer lecture et écriture (gravité basse ?).
 - **CW105 dans les arguments** : `npx mcp-remote http://hôte-distant/sse` n'est pas signalé
-  (seules les clés `url` le sont).
+  (seules les clés `url` le sont). Mesuré le 20 octobre : 1 seul cas sur 3 099 exemples.
 - **Fichiers `.code-workspace`** (VS Code) : réglages sous `"settings"` ; vérifier si VS Code
   y lit des serveurs MCP et `chat.tools.autoApprove`.
 - **Valeurs de CW109 sans tenir compte de la casse** (`BypassPermissions`) : seulement si
@@ -72,9 +71,7 @@ Le parking à idées. Une idée qui ne sert pas la phrase du projet atterrit ici
   `${env:A}littéral${env:B}` lu comme une référence (motif `.+` trop gourmand, antérieur à 0.3.0).
 
 ## Règle CW111 (14 octobre 2026)
-- **CW106 sur toute la ligne** : les options dangereuses sont cherchées partout, même dans les
-  arguments passés au conteneur (`docker run img --privileged`). `containers.run_image` sait
-  où s'arrêtent les options de `run` : l'utiliser aussi pour CW106.
+- ~~**CW106 sur toute la ligne**~~ : fait le 20 octobre 2026 (`containers.run_options`).
 - **Images officielles de Docker Hub** (`node`, `python`) non signalées : seul Docker peut y
   publier. À revoir si des utilisateurs le demandent.
 - **`docker compose run`** : l'image est dans `docker-compose.yml` (YAML, hors périmètre sans
@@ -85,6 +82,29 @@ Le parking à idées. Une idée qui ne sert pas la phrase du projet atterrit ici
   examinés pour les secrets (`--api-key …`) ni pour `--insecure`, seulement les programmes.
 - **Fin de ligne dans `command`** : `"cd x\nnpx …"` écrit dans `command` n'est pas découpé
   (sans shell, le client chercherait un programme de ce nom).
+
+## Version 0.4.0 (20 octobre 2026)
+- **Auto-test de l'Action en CI** : remplacer, dans le job « dogfooding » de `ci.yml`, l'installation
+  et le scan par `uses: ./` (fichier protégé : modification par le mainteneur).
+- **GitHub Marketplace** : publier l'Action (case à cocher à la création d'une release ; il faut
+  accepter les conditions de la Marketplace : décision du mainteneur).
+- **Exceptions par serveur** : cibler un serveur précis d'un fichier (`server=nom`), pas tout le
+  fichier ; il faudrait un champ « serveur » dans les constats.
+- **Hook pre-commit plus ciblé** : analyser seulement les fichiers modifiés (le CLI n'accepte
+  qu'un chemin aujourd'hui). Depuis la revue de l'Auditeur, le hook tourne à chaque commit :
+  un filtre sur les fichiers JSON laissait passer un secret ajouté ailleurs.
+- **Variables d'environnement qui changent ce qui s'exécute** (règle CW112 possible, à valider) :
+  `NODE_OPTIONS=--require …`, `LD_PRELOAD`, `BASH_ENV`, `PYTHONPATH`, mais aussi
+  `npm_config_package` (installe un paquet de plus), `npm_config_registry`, `UV_INDEX_URL`,
+  `PIP_INDEX_URL` (registre remplacé). Seul `npm_config_call` est signalé en 0.4.0 (CW101).
+- **CW106, isolation** : `--cgroupns=host`, `--security-opt label=disable` (SELinux coupé) et
+  `--device` sur un disque ne sont pas encore signalés.
+- **Ligne donnée à `npx -c "…"`** : signalée (CW101) mais pas analysée comme un script
+  (`bash -c`) ; un paquet non figé ou venu de GitHub à l'intérieur passerait sans alerte de plus.
+- **Azure Pipelines et autres CI** : `##vso[…]` est neutralisé dans les rapports ; un journal
+  produit par un autre outil reste à vérifier au cas par cas.
+- **Lanceurs pnpm dlx et bunx** : lus comme npx (options courantes identiques). Une lecture
+  exacte de leurs propres règles éviterait de rares fausses alertes.
 
 ## Nouvelles idées
 -

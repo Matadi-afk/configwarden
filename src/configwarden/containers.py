@@ -16,6 +16,11 @@ acceptées aussi après `run`), github.com/distribution/reference (grammaire, im
 officielle quand le nom n'a qu'un seul composant), opencontainers/go-digest (sha256,
 sha512).
 
+Sert aussi à CW106 (conteneur qui casse son isolation) : `run_option_pairs` lit les
+options de `run` comme pflag les lit, formes collées comprises (`-v/:/host`, `-iv/x`,
+`-v=/:/host`, `--privileged=1`) ; `loose_option_pairs` relit une ligne illisible mot
+par mot, par prudence (revue de l'Auditeur du 20 octobre 2026).
+
 Sécurité : chaque mot est lu une seule fois (temps linéaire). Une image de plus de
 512 caractères est ignorée avant toute expression régulière, et ces expressions n'ont
 pas d'imbrication ambiguë : pas de lenteur sur une entrée piégée.
@@ -207,24 +212,41 @@ _RUN_OPTIONS = {
 ENGINES = frozenset(_RUN_OPTIONS)
 
 
-def _short_cluster_needs_next(word: str, options: _Options) -> bool | None:
-    """Lit « -it », « -eKEY=V », « -e » (règles de spf13/pflag).
+Pair = tuple[str, str]  # (option telle qu'écrite, valeur) ; un booléen seul vaut « true »
 
-    Renvoie True si la dernière lettre attend sa valeur dans le mot suivant, False si
-    le groupe se suffit, None si une lettre est inconnue ou demande d'arrêter.
+
+def _read_short(
+    word: str, following: str | None, options: _Options
+) -> tuple[list[Pair], bool] | None:
+    """Lit « -it », « -v/:/h », « -v=/:/h », « -eKEY=V », « -e KEY=V » (règles de spf13/pflag).
+
+    Renvoie les couples (option, valeur) et si le mot suivant a été pris comme valeur de
+    la dernière lettre ; None si une lettre est inconnue, demande d'arrêter, ou si la
+    valeur manque (le moteur refuserait alors la ligne).
     """
+    pairs: list[Pair] = []
     for position in range(1, len(word)):
         letter = word[position]
         rest = word[position + 1 :]
-        if letter in options.short_stop:
+        if letter in options.short_stop or not (
+            letter in options.short_with_value or letter in options.short_boolean
+        ):
             return None
-        if letter in options.short_with_value:
-            return rest == ""  # sinon la suite du mot est la valeur (« -eKEY=V », « -e=V »)
-        if letter not in options.short_boolean:
+        name = "-" + letter
+        if len(rest) >= 2 and rest[0] == "=":
+            pairs.append((name, rest[1:]))  # « -v=/:/host », « -i=false »
+            return pairs, False
+        if letter in options.short_boolean:
+            pairs.append((name, "true"))  # « -it » : -i, puis la lettre suivante
+            continue
+        if rest:
+            pairs.append((name, rest))  # « -v/:/host », « -eKEY=V » : la suite est la valeur
+            return pairs, False
+        if following is None:
             return None
-        if rest.startswith("="):
-            return False  # « -i=false » : valeur explicite du booléen
-    return False
+        pairs.append((name, following))  # « -v /:/host »
+        return pairs, True
+    return pairs, False
 
 
 def _first_positional(args: list[str], start: int, options: _Options, *, run: bool) -> int | None:
@@ -246,21 +268,18 @@ def _first_positional(args: list[str], start: int, options: _Options, *, run: bo
             else:
                 return None  # option inconnue : prend-elle une valeur ? On ne devine pas.
         elif word.startswith("-") and len(word) > 1:
-            needs_next = _short_cluster_needs_next(word, options)
-            if needs_next is None:
+            following = args[index + 1] if index + 1 < len(args) else None
+            read = _read_short(word, following, options)
+            if read is None:
                 return None
-            index += 2 if needs_next else 1
+            index += 2 if read[1] else 1
         else:
             return index
     return None
 
 
-def run_image(engine: str, args: list[str]) -> str | None:
-    """L'image lancée par « <engine> [options] run|container run [options] IMAGE … ».
-
-    None si ce n'est pas un lancement de conteneur, si l'image vient d'un fichier ou
-    d'un stockage local, ou si la ligne ne peut pas être lue avec certitude.
-    """
+def _locate_run(engine: str, args: list[str]) -> tuple[int, int] | None:
+    """(début des options de `run`, position de l'image), ou None si incertain."""
     if engine not in ENGINES:
         return None
     command = _first_positional(args, 0, _GLOBAL_OPTIONS[engine], run=False)
@@ -273,7 +292,85 @@ def run_image(engine: str, args: list[str]) -> str | None:
     image_index = _first_positional(args, command + 1, _RUN_OPTIONS[engine], run=True)
     if image_index is None:
         return None
-    image = args[image_index]
+    return command + 1, image_index
+
+
+def run_options(engine: str, args: list[str]) -> list[str] | None:
+    """Les options de `run`, placées avant l'image (ce qui suit est donné au conteneur).
+
+    None si la ligne ne peut pas être lue avec certitude : l'appelant vérifie alors
+    toute la ligne, par prudence.
+    """
+    located = _locate_run(engine, args)
+    if located is None:
+        return None
+    start, image_index = located
+    # « -- » qui annonce l'image n'est pas une option.
+    end = image_index - 1 if image_index > start and args[image_index - 1] == "--" else image_index
+    return args[start:end]
+
+
+def _pairs(words: list[str], options: _Options, *, strict: bool) -> list[Pair]:
+    """Couples (option, valeur) d'une suite d'options, jusqu'à « -- ».
+
+    strict : la ligne a été lue avec certitude, chaque valeur n'est prise qu'une fois.
+    Sinon (ligne illisible), chaque mot est AUSSI examiné comme une option possible :
+    plus d'alertes peut-être, mais aucune option dangereuse n'est sautée.
+    """
+    pairs: list[Pair] = []
+    index = 0
+    while index < len(words):
+        word = words[index]
+        if word == "--":
+            break
+        following = words[index + 1] if index + 1 < len(words) else None
+        used_following = False
+        if word.startswith("--"):
+            name, has_value, value = word.partition("=")
+            if has_value:
+                pairs.append((name, value))  # « --privileged=1 », « --volume=/:/host »
+            elif name in options.boolean:
+                pairs.append((name, "true"))
+            elif following is not None:
+                pairs.append((name, following))
+                used_following = True
+        elif word.startswith("-") and len(word) > 1:
+            read = _read_short(word, following, options)
+            if read is not None:
+                pairs.extend(read[0])
+                used_following = read[1]
+        index += 2 if strict and used_following else 1
+    return pairs
+
+
+def run_option_pairs(engine: str, args: list[str]) -> list[Pair] | None:
+    """Les options de `run` placées avant l'image, en couples (option, valeur).
+
+    « -v/:/host », « -iv/x », « -v=/:/host » et « --privileged=1 » y sont lus comme Docker
+    les lit. None si la ligne ne peut pas être lue avec certitude.
+    """
+    located = _locate_run(engine, args)
+    if located is None:
+        return None
+    start, image_index = located
+    return _pairs(args[start:image_index], _RUN_OPTIONS[engine], strict=True)
+
+
+def loose_option_pairs(engine: str, args: list[str]) -> list[Pair]:
+    """Lecture prudente d'une ligne illisible : toutes les options qu'on y reconnaît."""
+    return _pairs(args, _RUN_OPTIONS.get(engine, _RUN_OPTIONS["docker"]), strict=False)
+
+
+def run_image(engine: str, args: list[str]) -> str | None:
+    """L'image lancée par « <engine> [options] run|container run [options] IMAGE … ».
+
+    None si ce n'est pas un lancement de conteneur, si l'image vient d'un fichier ou
+    d'un stockage local, ou si la ligne ne peut pas être lue avec certitude.
+    """
+    located = _locate_run(engine, args)
+    if located is None:
+        return None
+    image = args[located[1]]
     if engine == "podman" and image.startswith(_REGISTRY_TRANSPORT):
         image = image[len(_REGISTRY_TRANSPORT) :]
     if image.startswith(_LOCAL_TRANSPORTS):

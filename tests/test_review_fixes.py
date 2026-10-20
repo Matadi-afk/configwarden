@@ -92,7 +92,8 @@ def test_other_package_launchers_are_checked(write_mcp, command, args, expected)
     [
         ("uv", ["run", "--directory", "/srv/app", "server.py"]),
         ("uv", ["--directory", "/srv/app", "run", "server.py"]),
-        ("uv", ["run", "--with", "mcp", "mcp", "run", "server.py"]),
+        # Le paquet ajouté est figé : depuis la v0.4.0, « --with mcp » seul est signalé (CW102).
+        ("uv", ["run", "--with", "mcp==1.9.0", "mcp", "run", "server.py"]),
         ("pnpm", ["exec", "my-server"]),
         ("pnpm", ["install"]),
         ("pipx", ["install", "some-server"]),

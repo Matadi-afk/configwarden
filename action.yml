@@ -1,0 +1,97 @@
+# =============================================================================
+# Action GitHub de configwarden : analyse les configurations d'agents IA d'un dépôt.
+#
+# Utilisation, dans le workflow d'un autre projet (épingler l'empreinte complète du
+# commit, jamais une étiquette, qui peut être déplacée) :
+#   - uses: Matadi-afk/configwarden@<empreinte du commit>  # v0.4.0
+#     with:
+#       fail-on: high
+#
+# Sécurité :
+#  - rien n'est installé ni téléchargé : configwarden (aucune dépendance) tourne
+#    directement depuis le code de l'action, au commit épinglé par l'utilisateur ;
+#  - Python est lancé en mode isolé (-I) : le dépôt analysé (dossier courant) ne peut
+#    pas remplacer un module de configwarden ni de Python par le sien ;
+#  - les entrées passent par des variables d'environnement et sont vérifiées : elles ne
+#    sont jamais recopiées dans le script (pas d'injection de commande) ;
+#  - le rapport est affiché avec les commandes de workflow suspendues : un nom de fichier
+#    piégé (« ::error::… ») du dépôt analysé ne peut pas piloter le runner ;
+#  - aucune permission ni aucun secret n'est nécessaire.
+#
+# GitHub lance ce script avec « bash --noprofile --norc -eo pipefail » : toute commande
+# qui échoue arrête l'étape. Les codes de configwarden sont donc lus avec « || status=$? ».
+# =============================================================================
+name: configwarden
+description: Scan AI agent configurations (MCP servers, secrets) for security issues.
+author: configwarden contributors
+branding:
+  icon: shield
+  color: blue
+
+inputs:
+  path:
+    description: File or folder to scan.
+    default: "."
+  fail-on:
+    description: Minimum severity that makes the step fail (low, medium, high or critical).
+    default: low
+  exclude:
+    description: Globs to skip, one per line (e.g. examples/*).
+    default: ""
+  sarif-file:
+    description: Also write a SARIF report to this file, for github/codeql-action/upload-sarif.
+    default: ""
+  no-ignore:
+    description: Report everything without reading .configwarden-ignore (true or false).
+    default: "false"
+
+runs:
+  using: composite
+  steps:
+    - name: Run configwarden
+      shell: bash
+      env:
+        CW_PATH: ${{ inputs.path }}
+        CW_FAIL_ON: ${{ inputs.fail-on }}
+        CW_EXCLUDE: ${{ inputs.exclude }}
+        CW_SARIF: ${{ inputs.sarif-file }}
+        CW_NO_IGNORE: ${{ inputs.no-ignore }}
+        CW_SOURCE: ${{ github.action_path }}/src
+      run: |
+        set -euo pipefail
+        fail() { echo "::error title=configwarden::$1"; exit 2; }
+
+        PYTHON=""
+        for candidate in python3 python; do
+          if command -v "$candidate" >/dev/null 2>&1 &&
+            "$candidate" -c 'import sys; sys.exit(sys.version_info < (3, 10))' 2>/dev/null; then
+            PYTHON="$candidate"
+            break
+          fi
+        done
+        [ -n "$PYTHON" ] || fail "Python 3.10 or later is required (add actions/setup-python first)."
+
+        case "$CW_FAIL_ON" in low | medium | high | critical) ;; *) fail "fail-on must be low, medium, high or critical." ;; esac
+        case "$CW_NO_IGNORE" in true | false) ;; *) fail "no-ignore must be true or false." ;; esac
+        [ -n "$CW_PATH" ] || fail "path must not be empty."
+
+        options=(--fail-on "$CW_FAIL_ON")
+        while IFS= read -r pattern; do
+          pattern="${pattern%$'\r'}"
+          if [ -n "$pattern" ]; then options+=(--exclude "$pattern"); fi
+        done <<<"$CW_EXCLUDE"
+        if [ "$CW_NO_IGNORE" = "true" ]; then options+=(--no-ignore); fi
+
+        # -I : ni le dossier courant (le dépôt analysé) ni les variables PYTHON* ne
+        # changent les modules chargés. Le chemin du code est passé en argument.
+        configwarden() {
+          "$PYTHON" -I -c 'import runpy, sys; sys.path.insert(0, sys.argv.pop(1)); runpy.run_module("configwarden", run_name="__main__", alter_sys=True)' "$CW_SOURCE" "$@"
+        }
+
+        if [ -n "$CW_SARIF" ]; then
+          status=0
+          configwarden scan "${options[@]}" --format sarif --output "$CW_SARIF" -- "$CW_PATH" || status=$?
+          # 2 = erreur (chemin refusé…) : on s'arrête. 1 = alertes : le rapport texte suit.
+          if [ "$status" -eq 2 ]; then exit 2; fi
+        fi
+        configwarden scan "${options[@]}" -- "$CW_PATH"

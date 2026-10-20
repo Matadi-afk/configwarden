@@ -18,23 +18,27 @@ Toute idée qui ne sert pas cette phrase va dans `IDEES.md`, pas dans le code.
 
 ```
 src/configwarden/
-  cli.py            Commandes `scan` et `rules`, codes de sortie 0/1/2 ; --output refuse d'écrire à travers un lien symbolique
+  cli.py            Commandes `scan` et `rules`, codes de sortie 0/1/2 ; --output refuse d'écrire à travers un lien symbolique ; sous GitHub Actions, rapport texte entre « ::stop-commands:: » et un jeton aléatoire
   scanner.py        Parcours des fichiers (sans suivre les symlinks ; fichiers ordinaires seulement ; ignore binaires et > 1 Mo ; lit l'UTF-16/32 avec BOM) + appel des règles
   models.py         Severity (LOW < MEDIUM < HIGH < CRITICAL), Rule, Finding (chemin et message assainis à la création)
-  commands.py       analyse() : retire les enveloppes (cmd /c, wsl, env -S, sudo, uv run, bash -c, su -c…), ramène pnpm dlx / bun x / uv tool run… à npx / uvx et relève les risques CW101 ; suit TOUTES les commandes d'un script (Launch.commands : 1 + 20 au plus, limite commune aux scripts imbriqués)
-  containers.py     run_image() : image lancée par « docker/podman/nerdctl run » (options globales, options courtes groupées, option inconnue = analyse arrêtée) ; parse_reference() : grammaire officielle d'une image ; pinning_problem() pour CW111
+  commands.py       analyse() : retire les enveloppes (cmd /c, wsl, env -S, sudo, uv run, bash -c, su -c…), ramène pnpm dlx / bun x / uv tool run / npm exec… à npx / uvx et relève les risques CW101 ; suit TOUTES les commandes d'un script (Launch.commands : 1 + 20 au plus, limite commune aux scripts imbriqués ; Launch.truncated si dépassée -> CW100)
+  npm_args.py       parse_npx() / parse_npm_exec() : lecture EXACTE de npx et de npm exec (port de npx-cli.js et de nopt, données de npm 10.9.4) ; comparée à npm réel sur plus de 50 000 lignes (cas figés : tests/test_npm_args.py)
+  containers.py     run_image() : image lancée par « docker/podman/nerdctl run » (options globales, options courtes groupées, option inconnue = analyse arrêtée) ; run_option_pairs() : options avant l'image lues comme pflag (-v/:/h, -iv/x, --privileged=1) ; loose_option_pairs() : relecture prudente d'une ligne illisible ; parse_reference() : grammaire officielle d'une image ; pinning_problem() pour CW111
+  ignore.py         Fichier d'exceptions .configwarden-ignore : parse() (lignes coupées sur \n seulement, caractère de contrôle ou invisible refusé ; règle + fichier/dossier + until= facultatif + raison obligatoire, masquée par mask_secrets()), read() (pas de lien symbolique, 256 Ko max), apply() (arbre des dossiers ; exceptions toujours listées ; retirées du SARIF)
   values.py         Forme d'une valeur : modèle à remplir, booléen, nombre, mot, chemin (filtre les fausses alertes de CW001 et CW103)
   jsonc.py          loads() : JSON strict, sinon JSON avec commentaires et virgules finales (temps linéaire, positions conservées)
-  redact.py         redact() masque un secret ; redact_url() masque identifiants et paramètres d'URL ; url_origin() ne garde que « schéma://hôte/… » ; sanitize() neutralise les caractères de contrôle et invisibles
+  redact.py         redact() masque un secret ; redact_url() masque identifiants et paramètres d'URL ; url_origin() ne garde que « schéma://hôte/… » ; sanitize() neutralise les caractères de contrôle et invisibles ; json_for_logs() écrit « ## » en « #\u0023 » (commandes des journaux de CI)
   config.py         Secret + get_secret() : lecture sécurisée des variables d'environnement (étape 8)
   rules/
     __init__.py     ALL_RULES = liste de toutes les règles
-    secrets.py      CW001 : secrets en clair (regex par fournisseur)
+    secrets.py      CW001 : secrets en clair (regex par fournisseur) ; mask_secrets() pour un texte libre
     mcp.py          CW100-CW111 : configurations MCP dangereuses et réglages « tout approuver » ; lit tout fichier .json/.jsonc (voir « Formats reconnus »)
   reporters/        text.py, json_reporter.py, sarif.py (+ RENDERERS dans __init__)
-tests/              pytest ; conftest.py fournit fake_secret() et write_mcp ; test_hardening.py rejoue les attaques connues ; test_real_configs.py couvre le format de chaque outil IA ; test_review_fixes.py rejoue les constats de l'Auditeur et du grand test ; test_container_images.py couvre CW111 ; test_script_commands.py les commandes suivantes d'un script
+tests/              pytest ; conftest.py fournit fake_secret() et write_mcp ; test_hardening.py rejoue les attaques connues ; test_real_configs.py couvre le format de chaque outil IA ; test_review_fixes.py rejoue les constats de l'Auditeur et du grand test ; test_container_images.py couvre CW111 ; test_script_commands.py les commandes suivantes d'un script ; test_ignore.py le fichier d'exceptions ; test_v040_fixes.py CW102 --with et CW106 ; test_fuzz.py les propriétés (Hypothesis) ; test_action.py l'Action GitHub (lancée comme GitHub : bash -eo pipefail) et le hook pre-commit ; test_audit_v040.py rejoue les preuves de la revue de la 0.4.0 ; test_npm_args.py fige les réponses de npm réel
 examples/           vulnerable-mcp/ (doit déclencher CW101-CW111) et safe-mcp/ (doit rester propre). Fichiers nommés pour qu'aucun outil IA ne les charge (jamais `.vscode/mcp.json`, `.mcp.json`, `.claude/settings.json`…)
 docs/GUIDE-FR.md    Guide d'installation pas à pas pour débutant (Windows/macOS)
+action.yml          Action GitHub (composite) : lance configwarden depuis son propre code, Python en mode isolé, entrées par variables d'environnement
+.pre-commit-hooks.yaml  Hook pre-commit pour les autres projets (id: configwarden)
 ```
 
 ## Règles existantes
@@ -42,13 +46,13 @@ docs/GUIDE-FR.md    Guide d'installation pas à pas pour débutant (Windows/macO
 | ID | Gravité | Fichier | Détecte |
 |----|---------|---------|---------|
 | CW001 | critical | rules/secrets.py | Clé API ou token en clair (exemples de documentation ignorés : `…EXAMPLE`, `xxxx`, clé tronquée) |
-| CW100 | medium | rules/mcp.py | Config MCP illisible (certains outils lancent quand même une partie d'un fichier abîmé) |
-| CW101 | high | rules/mcp.py | Shell qui reçoit un script (`bash -c`, `pwsh -Command`, `su -c`), `cmd /c` ou WSL avec une ligne de commande ou des caractères spéciaux, `npx -c`, opérateurs shell dans `command`, code en ligne (`node -e`, `python -c`) |
+| CW100 | medium | rules/mcp.py | Config MCP illisible (certains outils lancent quand même une partie d'un fichier abîmé), ou script trop long pour être vérifié en entier |
+| CW101 | high | rules/mcp.py | Shell qui reçoit un script (`bash -c`, `pwsh -Command`, `su -c`), `cmd /c` ou WSL avec une ligne de commande ou des caractères spéciaux, `npx -c` et `npm exec -c` (lus exactement comme npm), `pnpm -c dlx`, `npm_config_call`, opérateurs shell dans `command`, code en ligne (`node -e`, `python -c`) |
 | CW102 | medium | rules/mcp.py | Paquet du registre sans version **exacte** (`^1.0`, `@beta`, `>=1` ne comptent pas), quel que soit le lanceur (npx, uvx, pnpm dlx, bun x, uv tool run, pipx run, deno run npm:…) ; chemin local ignoré |
 | CW103 | high | rules/mcp.py | Secret littéral dans `env`, `headers`, la ligne de commande (`--api-key`, `-e TOKEN=`) ou une URL (mot de passe, `?token=`), valeur par défaut de `${VAR:-…}` ; références, modèles, réglages et chemins ignorés (values.py) |
 | CW104 | high | rules/mcp.py | Serveur filesystem ouvert sur `/`, un lecteur entier ou un dossier personnel complet |
 | CW105 | high | rules/mcp.py | Serveur distant en `http://` |
-| CW106 | high | rules/mcp.py | Conteneur Docker/Podman qui casse l'isolation (`--privileged`, `=host`, montage de `/`, du dossier personnel, de `.ssh`/`.aws`… ou du socket Docker) |
+| CW106 | high | rules/mcp.py + containers.py | Conteneur Docker/Podman qui casse l'isolation (`--privileged`, `=host`, montage de `/`, du dossier personnel, de `.ssh`/`.aws`… ou du socket Docker), formes collées comprises (`-v/:/host`, `--privileged=1`) |
 | CW107 | high | rules/mcp.py | Paquet ou script installé depuis git, une URL, un raccourci GitHub `auteur/projet` ou `nom @ url`, y compris `uv run --with` et `deno run https://…` (remplace CW102 pour ce paquet) |
 | CW108 | medium | rules/mcp.py | Outils approuvés sans confirmation (`alwaysAllow`, `autoApprove`, `trust: true`) |
 | CW109 | high | rules/mcp.py | Réglage de l'outil IA qui approuve tout : Claude Code (`enableAllProjectMcpServers`, `bypassPermissions`, `skipDangerousModePermissionPrompt`), VS Code (`chat.tools.global.autoApprove`), Zed, Cursor (`*:*`), Kiro (Autopilot) |
@@ -82,10 +86,11 @@ Elles se lancent depuis la racine du projet, avec l'environnement `.venv` activ�
 
 ```bash
 pip install -e ".[dev]"                     # installation (une fois)
-pytest                                      # tests
+pytest                                      # tests (dont 150 exemples par propriété Hypothesis)
+$env:CONFIGWARDEN_HYPOTHESIS = "fuzz" ; pytest tests/test_fuzz.py   # fuzzing long (5 000 exemples)
 ruff check . ; ruff format .                # qualité + sécurité (règles Bandit "S")
 pre-commit run --all-files                  # tous les contrôles, dont gitleaks
-configwarden scan examples/vulnerable-mcp     # démo : 13 constats attendus
+configwarden scan examples/vulnerable-mcp     # démo : 15 constats attendus
 configwarden scan . --exclude "examples/*"    # auto-scan : 0 constat attendu
 ```
 
@@ -106,6 +111,10 @@ configwarden scan . --exclude "examples/*"    # auto-scan : 0 constat attendu
 - Les secrets de l'application se lisent via `config.get_secret()` et restent enveloppés dans `Secret` jusqu'à `.reveal()`.
 - Pas d'`eval`, d'`exec`, de `pickle`, ni de `subprocess` avec `shell=True`.
 - Le scanner lit, il n'exécute jamais rien de ce qu'il analyse.
+- **Action GitHub** (`action.yml`) : les entrées passent par `env:` et sont vérifiées, jamais `${{ inputs.* }}` dans un script ; Python lancé avec `-I` (le dépôt analysé ne peut pas remplacer un module) ; rien n'est installé.
+- **Exceptions** : une alerte mise en exception reste toujours visible (texte, JSON) ; un message sur le fichier d'exceptions cite un numéro de ligne, jamais son contenu.
+- **Lire comme le vrai programme** : npx et npm exec passent par `npm_args.py` (fidèle à npm, jamais une liste d'options devinée) ; docker run par les règles de pflag ; `--with` est découpé comme uv. Une ligne qu'on ne sait pas lire avec certitude est relue prudemment, jamais ignorée. Quand npm change, refaire la comparaison avec npm réel.
+- **Journaux de CI** : aucune ligne d'un rapport ne commence par « :: », « ## » est neutralisé dans tous les formats, et le rapport texte est encadré par « ::stop-commands:: » sous GitHub Actions.
 - Ne pas désactiver un contrôle (`--no-verify`, `# noqa` non justifié) pour faire passer un commit.
 
 ## Checklist sécurité (obligatoire pour TOUTE modification)
@@ -131,10 +140,10 @@ Fil rouge du projet : configwarden est un outil de sécurité, il doit être lui
 
 ## Fichiers à ne pas modifier sans accord explicite du mainteneur
 
-`.github/workflows/`, `.pre-commit-config.yaml`, `.gitignore`, `LICENSE`, `pyproject.toml` (section `dependencies`).
+`.github/workflows/`, `.pre-commit-config.yaml`, `.gitignore`, `LICENSE`, `pyproject.toml` (section `dependencies`), `action.yml` et `.pre-commit-hooks.yaml` (interfaces utilisées par d'autres projets).
 
 ## État du projet
 
 - Version 0.3.0 (12 règles) : vrais fichiers de configuration, commandes enveloppées, CW109 et SARIF, puis corrections de la revue de l'Auditeur et du grand test sur 3 099 exemples publiés (règle CW110). 572 tests. Notes de version dans `CHANGELOG.md` : à compléter à chaque nouvelle version.
-- En cours (0.4.0) : CW111, image de conteneur non figée (décision du 14 octobre 2026) ; toutes les commandes d'un script vérifiées. 747 tests.
+- Version 0.4.0 (13 règles) : CW111 (image de conteneur non figée), toutes les commandes d'un script, fichier d'exceptions `.configwarden-ignore`, Action GitHub et hook pre-commit, CW102 pour `--with`, CW106 limité aux options avant l'image, tests de propriétés (Hypothesis) ; puis corrections de la revue de l'Auditeur (lecture exacte de npx et npm exec, options collées de Docker, journaux de CI protégés), contre-vérifiées sans défaut moyen ou plus. 1 012 tests.
 - Cap fixé jusqu'au 4 novembre 2026 : publier sur GitHub, ajouter 3 règles, faire un premier post. Voir `IDEES.md` pour ce qui est volontairement mis de côté.

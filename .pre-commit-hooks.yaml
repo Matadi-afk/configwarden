@@ -1,0 +1,22 @@
+# =============================================================================
+# Hook pre-commit de configwarden, pour les AUTRES projets.
+#
+# Dans le fichier .pre-commit-config.yaml d'un projet (épingler l'empreinte du commit) :
+#   - repo: https://github.com/Matadi-afk/configwarden
+#     rev: <empreinte du commit>  # frozen: v0.4.0
+#     hooks:
+#       - id: configwarden
+#
+# Le hook se lance à CHAQUE commit et analyse tout le dépôt : une configuration MCP
+# dangereuse ou un secret, dans n'importe quel fichier, bloque le commit. (Un filtre sur
+# les fichiers JSON laissait passer un secret ajouté dans un autre fichier : revue de
+# l'Auditeur du 20 octobre 2026.)
+# =============================================================================
+- id: configwarden
+  name: configwarden (AI agent configurations)
+  description: Scan MCP server configurations and secrets for security issues.
+  entry: configwarden scan
+  language: python
+  pass_filenames: false
+  always_run: true
+  minimum_pre_commit_version: "3.0.0"

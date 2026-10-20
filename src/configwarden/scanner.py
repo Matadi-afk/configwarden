@@ -18,7 +18,7 @@ from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 
-from configwarden.models import Finding
+from configwarden.models import Finding, Suppressed
 from configwarden.rules import mcp, secrets
 
 MAX_FILE_SIZE = 1_000_000  # 1 Mo
@@ -44,6 +44,7 @@ DEFAULT_IGNORED_DIRS = {
     ".pytest_cache",
     ".ruff_cache",
     ".mypy_cache",
+    ".hypothesis",  # cache des tests de propriétés (constantes du code, chemins locaux)
     ".tox",
     "dist",
     "build",
@@ -58,6 +59,11 @@ class ScanResult:
     # Dossier de référence des chemins des constats (chemin absolu). Sert au rapport
     # SARIF ; n'apparaît jamais dans un rapport (il peut contenir un nom d'utilisateur).
     root: str = ""
+    # Exceptions (`.configwarden-ignore`, voir ignore.py) : alertes acceptées, toujours
+    # listées avec leur raison, et remarques sur le fichier (lignes fautives, expirées…).
+    suppressed: list[Suppressed] = field(default_factory=list)
+    ignore_notes: list[str] = field(default_factory=list)
+    ignore_file: str = ""
 
 
 def _is_excluded(relative: PurePosixPath, patterns: Iterable[str]) -> bool:

@@ -13,6 +13,7 @@ from urllib.parse import quote
 
 from configwarden import __version__
 from configwarden.models import Severity
+from configwarden.redact import json_for_logs
 from configwarden.rules import ALL_RULES
 from configwarden.scanner import ScanResult
 
@@ -103,7 +104,11 @@ def render_sarif(result: ScanResult, **_: object) -> str:
                     }
                 },
                 "results": results,
+                # Les alertes mises en exception sont retirées (décision du 20 octobre
+                # 2026) : GitHub ignore le marquage « suppressions » de la norme et les
+                # afficherait comme des alertes ouvertes. Leur nombre reste indiqué.
+                "properties": {"suppressedResults": len(result.suppressed)},
             }
         ],
     }
-    return json.dumps(sarif, indent=2, ensure_ascii=False)
+    return json_for_logs(json.dumps(sarif, indent=2, ensure_ascii=False))

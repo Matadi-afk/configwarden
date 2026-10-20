@@ -152,8 +152,10 @@ def test_commands_from_several_scripts_share_one_limit() -> None:
 
 
 def test_script_split_and_words_are_bounded() -> None:
-    assert len(commands._split_posix("a;" * 5_000)) <= 21
-    assert len(commands._split_windows("a&" * 5_000)) <= 21
+    # 1 + 20 commandes vérifiées, plus 1 « témoin » : il montre que le script en contenait
+    # trop, ce qui est alors signalé (CW100, revue de l'Auditeur du 20 octobre 2026).
+    assert len(commands._split_posix("a;" * 5_000)) == 22
+    assert len(commands._split_windows("a&" * 5_000)) == 22
     launch = commands.analyse("bash", ["-c", "npx " + "x " * 5_000])
     assert all(len(command) <= 200 for command in launch.commands)
 
@@ -191,5 +193,6 @@ def test_huge_scripts_are_fast(script) -> None:
 def test_huge_script_in_a_file_does_not_crash(write_mcp) -> None:
     script = "; ".join(["cd x && npx -y some-server"] * 30_000)[:900_000]
     start = time.perf_counter()
-    assert ids_for(write_mcp, "bash", ["-c", script]) == ["CW101", "CW102"]
+    # CW100 : la limite de commandes est atteinte, ce qui suit n'est pas vérifié (signalé).
+    assert ids_for(write_mcp, "bash", ["-c", script]) == ["CW100", "CW101", "CW102"]
     assert time.perf_counter() - start < 5

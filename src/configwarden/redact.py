@@ -176,6 +176,17 @@ def _escape(char: str) -> str:
     return f"\\U{code:08x}"
 
 
+def json_for_logs(json_text: str) -> str:
+    """Un JSON sans « ## » littéral, toujours valide et au contenu identique.
+
+    Affiché dans un journal de CI, « ##[…] » (GitHub Actions) ou « ##vso[…] » (Azure
+    Pipelines) serait lu comme une commande, où qu'il soit dans la ligne. « \\u0023 »
+    est l'écriture JSON de « # » : le texte décodé ne change pas. « ## » n'apparaît que
+    dans des chaînes, et aucun échappement JSON ne commence ni ne finit par « # ».
+    """
+    return json_text.replace("##", "#\\u0023")
+
+
 def sanitize(text: str) -> str:
     """Rend visibles (et inoffensifs) les caractères de contrôle d'un texte.
 

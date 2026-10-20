@@ -60,3 +60,15 @@ class Finding:
         data = asdict(self)
         data["rule"]["severity"] = self.rule.severity.value
         return data
+
+
+@dataclass(frozen=True)
+class Suppressed:
+    """Une alerte mise en exception par `.configwarden-ignore` (avec la raison donnée)."""
+
+    finding: Finding
+    reason: str  # déjà assainie
+    line: int  # ligne de l'exception dans le fichier
+
+    def to_dict(self) -> dict:
+        return {**self.finding.to_dict(), "reason": self.reason, "ignore_line": self.line}

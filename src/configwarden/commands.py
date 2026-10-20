@@ -33,6 +33,8 @@ import shlex
 from collections import deque
 from dataclasses import dataclass, field
 
+from configwarden.npm_args import parse_npm_exec, parse_npx
+
 _WINDOWS_SUFFIXES = (".exe", ".cmd", ".bat", ".com")
 
 # Enveloppes et leurs options suivies d'une valeur (env a son propre analyseur).
@@ -109,32 +111,21 @@ _CMD_EXEC_FLAGS = {"/c", "/k", "/r"}
 _CMD_METACHARACTERS = frozenset("&|<>^%!")
 _SHELL_OPERATORS = frozenset(";&|()<>")
 # Opérateurs qui font d'un texte une ligne de commande pour un shell.
-_COMMAND_LINE_OPERATORS = frozenset("&|;<>`")
+_COMMAND_LINE_OPERATORS = frozenset("&|;<>`\n\r")
 # Modèle à remplir entre chevrons : lettres, chiffres, espaces et ponctuation simple.
 # Ni « ` » ni « $ » : un shell exécuterait ce qu'ils entourent.
 _ANGLE_PLACEHOLDER = re.compile(r"<[A-Za-z0-9_ .,:/'-]{1,64}>")
 
 # Lanceurs de paquets : téléchargent un paquet du registre et l'exécutent.
 _NPM_RUNNERS = {"npx", "pnpx", "bunx"}
-# Options de npx suivies d'une valeur, et options qui passent une ligne à un shell.
-_NPX_OPTIONS_WITH_VALUE = {
-    "--package",
-    "-p",
-    "--call",
-    "-c",
-    "--registry",
-    "--cache",
-    "--userconfig",
-    "--prefix",
-    "--loglevel",
-    "--workspace",
-    "-w",
-}
-_NPX_SHELL_OPTIONS = {"-c", "--call", "--shell-mode"}
+# pnpm (« pnpm exec -c », « pnpm -c dlx », « pnpm dlx --shell-mode ») : ligne pour un shell.
+_PNPM_SHELL_OPTIONS = {"-c", "--shell-mode"}
+# « npm_config_call=… » : npm exécute cette ligne dans un shell (comme « npx -c »).
+_NPM_CONFIG_CALL = re.compile(r"npm_config_call=\S", re.IGNORECASE)
 
 # Gestionnaires de paquets : options globales suivies d'une valeur (avant la sous-commande).
 _GLOBAL_OPTIONS_WITH_VALUE: dict[str, set[str]] = {
-    "npm": {"--prefix", "--userconfig", "--cache", "--registry", "--loglevel", "-w", "--workspace"},
+    "npm": set(),  # npm est lu exactement comme npm le fait : voir npm_args.parse_npm_exec
     "pnpm": {"-C", "--dir", "-F", "--filter", "--reporter", "--loglevel", "--package"},
     "yarn": {"--cwd"},
     "bun": {"--cwd"},
@@ -157,8 +148,6 @@ _GLOBAL_OPTIONS_WITH_VALUE: dict[str, set[str]] = {
 }
 # Sous-commandes qui téléchargent et lancent un paquet : ramenées au lanceur court.
 _PACKAGE_SUBCOMMANDS: dict[tuple[str, str], str] = {
-    ("npm", "exec"): "npx",
-    ("npm", "x"): "npx",
     ("pnpm", "dlx"): "npx",
     ("yarn", "dlx"): "npx",
     ("bun", "x"): "bunx",
@@ -283,6 +272,8 @@ class Launch:
     words: list[str] = field(default_factory=list)
     # Commandes suivantes d'un script (« bash -c "cd x && npx …" »), enveloppes retirées.
     others: list[list[str]] = field(default_factory=list)
+    # Vrai si une limite (nombre de commandes, imbrication) a empêché de tout lire.
+    truncated: bool = False
 
     @property
     def executable(self) -> str:
@@ -468,35 +459,28 @@ def _inline_code(interpreter: str, executable: str, tokens: list[str], index: in
     return None
 
 
-def _npx_shell_option(tokens: list[str], index: int) -> str | None:
-    """`npx -c "…"` / `pnpm dlx -c "…"` : l'option qui passe une ligne à un shell."""
-    while index < len(tokens):
-        arg = tokens[index]
-        name = arg.split("=", 1)[0]
-        if name in _NPX_SHELL_OPTIONS:
-            return name
-        if arg == "--" or not arg.startswith("-"):
-            return None  # le paquet : la suite lui appartient
-        index += 2 if arg in _NPX_OPTIONS_WITH_VALUE else 1
-    return None
-
-
-def _subcommand(program: str, tokens: list[str], index: int) -> tuple[int, list[str]] | None:
-    """Position de la sous-commande d'un gestionnaire, et ses options « --package »."""
+def _subcommand(
+    program: str, tokens: list[str], index: int
+) -> tuple[int, list[str], str | None] | None:
+    """Position de la sous-commande d'un gestionnaire, ses options « --package », et
+    l'option shell de pnpm placée avant elle (« pnpm -c exec "…" », « pnpm -c dlx "…" »)."""
     with_value = _GLOBAL_OPTIONS_WITH_VALUE[program]
     package_options: list[str] = []
+    shell_option: str | None = None
     while index < len(tokens):
         arg = tokens[index]
         if arg == "--package" and index + 1 < len(tokens):
             package_options += [arg, tokens[index + 1]]  # pnpm --package=x dlx …
         elif arg.startswith("--package="):
             package_options.append(arg)
+        elif program == "pnpm" and arg in _PNPM_SHELL_OPTIONS:
+            shell_option = arg
         if arg in with_value:
             index += 2
         elif arg.startswith("-"):
             index += 1
         else:
-            return index, package_options
+            return index, package_options, shell_option
     return None
 
 
@@ -511,7 +495,7 @@ def _after_run(
         name, equals, value = arg.partition("=")
         if arg == "--":
             return index + 1, sources, None
-        if subcommand == ("pnpm", "exec") and name in _NPX_SHELL_OPTIONS:
+        if subcommand == ("pnpm", "exec") and name in _PNPM_SHELL_OPTIONS:
             return index, sources, name  # pnpm exec -c : ligne de commande pour un shell
         if subcommand == ("uv", "run") and name in _UV_WITH_OPTIONS:
             if equals:
@@ -600,8 +584,64 @@ def _shell_metacharacters_from(tokens: list[str]) -> list[bool]:
     return flags
 
 
+def _shell_preprocess(script: str) -> tuple[str, list[str]]:
+    """Retire les commentaires et sort les substitutions `…` et $(…) d'un script POSIX.
+
+    Comme bash : « # » ne commence un commentaire qu'en début de mot et hors guillemets
+    (« build#1 » n'en est pas un) ; une substitution s'exécute même entre guillemets
+    doubles. Chaque substitution est remplacée par un mot neutre, et son contenu est
+    renvoyé à part pour être analysé comme un script. Un seul passage, temps linéaire.
+    """
+    out: list[str] = []
+    inner: list[str] = []
+    quote = ""
+    index, length = 0, len(script)
+    while index < length:
+        char = script[index]
+        if quote == "'":
+            out.append(char)
+            quote = "" if char == "'" else quote
+            index += 1
+            continue
+        if char == "\\" and index + 1 < length:
+            out.append(script[index : index + 2])
+            index += 2
+            continue
+        if char == "`" or (char == "$" and script.startswith("$(", index)):
+            closing = "`" if char == "`" else ")"
+            start = index + (1 if char == "`" else 2)
+            depth, end = 1, start
+            while end < length and depth:
+                if closing == ")" and script[end] == "(":
+                    depth += 1
+                elif script[end] == closing:
+                    depth -= 1
+                end += 1
+            inner.append(script[start : end - 1 if not depth else end])
+            out.append("_")
+            index = end
+            continue
+        if quote == '"':
+            out.append(char)
+            quote = "" if char == '"' else quote
+        elif char in "'\"":
+            out.append(char)
+            quote = char
+        elif char == "#" and (not out or out[-1][-1:].isspace() or out[-1][-1:] in ";&|()<>"):
+            newline = script.find("\n", index)
+            index = length if newline < 0 else newline
+            continue
+        else:
+            out.append(char)
+        index += 1
+    return "".join(out), inner
+
+
 def _split_commands(words: list[str]) -> list[list[str]]:
-    """Commandes d'une suite de mots, séparées par ; && || | & ( ) (au plus 1 + 20).
+    """Commandes d'une suite de mots, séparées par ; && || | & ( ) (au plus 1 + 21).
+
+    Une commande de plus que la limite est gardée : l'appelant sait ainsi que le script
+    en contenait trop, et le signale.
 
     Après une redirection (« > fichier », « 2>&1 », « < entrée »), le mot suivant est un
     fichier, pas le début d'une commande.
@@ -618,7 +658,7 @@ def _split_commands(words: list[str]) -> list[list[str]]:
             elif current:
                 found.append(current)
                 current = []
-                if len(found) > _MAX_COMMANDS:
+                if len(found) > _MAX_COMMANDS + 1:
                     return found
         elif len(current) < _MAX_WORDS:
             current.append(word.strip("'\""))
@@ -627,18 +667,27 @@ def _split_commands(words: list[str]) -> list[list[str]]:
     return found
 
 
-def _split_posix(script: str) -> list[list[str]]:
-    # Une fin de ligne sépare deux commandes, comme « ; » (shlex n'y voit qu'un espace).
-    # Le « ; » est placé APRÈS elle, pour qu'un commentaire « # … » s'arrête bien là ;
-    # une ligne continuée (barre oblique inverse en fin de ligne) reste une commande.
-    script = script[:_SCRIPT_LIMIT].replace("\\\n", " ").replace("\n", "\n;")
+def _split_posix(script: str, depth: int = 0) -> list[list[str]]:
+    # Une ligne continuée (barre oblique inverse en fin de ligne) reste une commande ; une
+    # fin de ligne sépare deux commandes, comme « ; » (shlex n'y voit qu'un espace).
+    script = script[:_SCRIPT_LIMIT].replace("\\\n", " ")
+    cleaned, substitutions = _shell_preprocess(script)
+    cleaned = cleaned.replace("\n", "\n;")
     try:
-        lexer = shlex.shlex(script, posix=True, punctuation_chars=True)
+        lexer = shlex.shlex(cleaned, posix=True, punctuation_chars=True)
         lexer.whitespace_split = True
-        return _split_commands(list(lexer))
+        lexer.commenters = ""  # commentaires déjà retirés, à la manière de bash
+        found = _split_commands(list(lexer))
     except ValueError:
         # Guillemet jamais fermé : découpage simple, sans planter.
-        return _split_commands(_FALLBACK_WORD.findall(script))
+        found = _split_commands(_FALLBACK_WORD.findall(cleaned))
+    if depth < _MAX_SCRIPTS:
+        # Les commandes des substitutions s'exécutent aussi : elles suivent la 1re commande.
+        for inner in substitutions[: _MAX_COMMANDS + 1]:
+            found.extend(_split_posix(inner, depth + 1))
+            if len(found) > _MAX_COMMANDS + 1:
+                break
+    return found
 
 
 def _split_windows(text: str, *, powershell: bool = False) -> list[list[str]]:
@@ -647,7 +696,7 @@ def _split_windows(text: str, *, powershell: bool = False) -> list[list[str]]:
     if powershell:
         text = text.replace("\n", ";")  # une instruction par ligne
         return _split_commands(_POWERSHELL_WORD.findall(text))
-    return _split_commands(_WINDOWS_WORD.findall(text))
+    return _split_commands(_WINDOWS_WORD.findall(text.replace("\n", " & ")))
 
 
 def _split_words(text: str) -> list[str]:
@@ -713,11 +762,14 @@ class _Work:
     queued: int = 0
     scripts: int = 0
     splits: int = 0
+    # Une limite a été atteinte : certaines commandes n'ont pas été lues (signalé, CW100).
+    truncated: bool = False
 
     def first_of(self, found: list[list[str]]) -> list[str]:
         """1re commande d'un script ; les suivantes attendent leur tour (20 au plus)."""
         for command in found[1:]:
             if self.queued >= _MAX_COMMANDS:
+                self.truncated = True
                 break
             self.queued += 1
             self.pending.append(command)
@@ -744,7 +796,12 @@ def analyse(command: str, args: list[str]) -> Launch:
         if unwrapped:
             others.append(unwrapped)
     return Launch(
-        tokens=first, risks=work.risks, sources=work.sources, words=list(tokens), others=others
+        tokens=first,
+        risks=work.risks,
+        sources=work.sources,
+        words=list(tokens),
+        others=others,
+        truncated=work.truncated,
     )
 
 
@@ -759,11 +816,24 @@ def _unwrap(tokens: list[str], work: _Work) -> list[str]:
     shell_meta: tuple[list[str], list[bool]] | None = None
     while start < len(tokens):
         if _ASSIGNMENT_WORD.match(tokens[start]) or tokens[start] in _SCRIPT_KEYWORDS:
+            if _NPM_CONFIG_CALL.match(tokens[start]):
+                risks.append("executes a command line through 'npm_config_call'")
             start += 1  # « FOO=1 npx … », « then npx … » : rien n'est lancé par ce mot
             continue
         executable = executable_name(tokens[start])
+        if executable == "call":
+            start += 1  # cmd : « call programme » lance ce programme
+            continue
+        if executable == "start":
+            # cmd : « start "titre" /b programme » ; le titre et les options /x sont passés.
+            start += 1
+            while start < len(tokens) and (not tokens[start] or tokens[start][:1] == "/"):
+                start += 1
+            continue
         if executable == "env":
             position, split = _after_env(tokens, start + 1)
+            if any(_NPM_CONFIG_CALL.match(word) for word in tokens[start + 1 : position]):
+                risks.append("executes a command line through 'npm_config_call'")
             if split is None:
                 start = position
                 continue
@@ -806,6 +876,7 @@ def _unwrap(tokens: list[str], work: _Work) -> list[str]:
                 break
             risks.append(f"executes commands through '{shorten(executable)} {shorten(flag)}'")
             if work.scripts >= _MAX_SCRIPTS:
+                work.truncated = True
                 tokens, start = [], 0
                 break
             work.scripts += 1
@@ -820,18 +891,28 @@ def _unwrap(tokens: list[str], work: _Work) -> list[str]:
                 tokens, start = [], 0
                 break
             if module.lower().startswith(("npm:", "jsr:")):
+                # « -- » : le paquet de deno n'est jamais lu comme une option de npx.
                 tokens, start, metacharacters = (
-                    ["npx", module[4:], *tokens[position + 1 :]],
+                    ["npx", "--", module[4:], *tokens[position + 1 :]],
                     0,
                     None,
                 )
                 label = f"deno {subcommand}"
                 continue
             break
+        if executable == "npm":
+            # npm lit ses options partout sur la ligne (npm_args.py) : seule `npm exec` (ou
+            # `npm x`) lance un paquet. Elle est transmise sous la forme exacte de npx.
+            reading = parse_npm_exec(tokens[start + 1 :])
+            if reading is None:
+                break
+            tokens, start, metacharacters = ["npx", *reading.as_npx_args()], 0, None
+            label = "npm exec"
+            continue
         if executable in _GLOBAL_OPTIONS_WITH_VALUE:
             found_sub = _subcommand(executable, tokens, start + 1)
             if found_sub is not None:
-                sub, package_options = found_sub
+                sub, package_options, shell_option = found_sub
                 word = tokens[sub].lower()
                 next_word = tokens[sub + 1].lower() if sub + 1 < len(tokens) else ""
                 if (executable, word, next_word) == ("uv", "tool", "run"):
@@ -840,7 +921,8 @@ def _unwrap(tokens: list[str], work: _Work) -> list[str]:
                     continue
                 runner = _PACKAGE_SUBCOMMANDS.get((executable, word))
                 if runner is not None:
-                    tokens = [runner, *package_options, *tokens[sub + 1 :]]
+                    shell_mode = ["--shell-mode"] if shell_option else []  # pnpm -c dlx …
+                    tokens = [runner, *package_options, *shell_mode, *tokens[sub + 1 :]]
                     start, metacharacters = 0, None
                     label = f"{executable} {word}"
                     continue
@@ -849,6 +931,8 @@ def _unwrap(tokens: list[str], work: _Work) -> list[str]:
                         (executable, word), tokens, sub + 1
                     )
                     sources.extend(found_sources)
+                    if shell_flag is None and (executable, word) == ("pnpm", "exec"):
+                        shell_flag = shell_option  # pnpm -c exec "…"
                     if shell_flag is not None:
                         risks.append(
                             f"executes a command line through '{executable} {word} {shell_flag}'"
@@ -867,7 +951,8 @@ def _unwrap(tokens: list[str], work: _Work) -> list[str]:
                     continue
             # Sous-commande inconnue : « bun -e … » reste vérifié plus bas (code en ligne).
         if executable in _NPM_RUNNERS:
-            shell_flag = _npx_shell_option(tokens, start + 1)
+            # `npx -c "…"` (lu exactement comme npm 10) ou `pnpm dlx --shell-mode "…"`.
+            shell_flag = parse_npx(tokens[start + 1 :]).shell_option()
             if shell_flag is not None:
                 runner_name = shorten(label or executable)
                 risks.append(f"executes a command line through '{runner_name} {shell_flag}'")
@@ -898,6 +983,7 @@ def _unwrap(tokens: list[str], work: _Work) -> list[str]:
             flag, script = found_script
             risks.append(f"executes commands through '{shorten(executable)} {shorten(flag)}'")
             if work.scripts >= _MAX_SCRIPTS:
+                work.truncated = True
                 tokens, start = [], 0
                 break
             work.scripts += 1
@@ -916,6 +1002,7 @@ def _unwrap(tokens: list[str], work: _Work) -> list[str]:
                 break
             risks.append(f"executes commands through '{shorten(executable)} {shorten(flag)}'")
             if work.scripts >= _MAX_SCRIPTS:
+                work.truncated = True
                 tokens, start = [], 0
                 break
             work.scripts += 1

@@ -5,11 +5,34 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-10-20
+
+### Security
+Found by an independent review of this release before publication, then re-checked by a second pass. Some of these gaps also affect 0.3.0. They all require a configuration or a repository crafted by an attacker. No user report, no known exploitation.
+- **`npx` options were misread**: an option configwarden did not know was assumed to take no value, so `npx --cafile ca.pem -c "…"` (a shell) or a package from GitHub placed after such an option went unreported. `npx` is now read exactly as npm 10 reads it (`npx-cli.js`, then `nopt`: abbreviations, grouped letters, `--no-` options, value types), compared with npm itself on more than 50,000 generated command lines. `npm exec` / `npm x` are read the way npm reads them, with options anywhere on the line (`npm -c "…" exec`, `npm exec server --package=github:…`), `pnpm -c dlx` and `pnpm -c exec` are recognised, and the `npm_config_call` environment variable, which makes npm run a command line in a shell, is reported (CW101).
+- **Glued container options were missed** (CW106): `-v/:/host`, `-iv/var/run/docker.sock:/s`, `-v=/:/host` and `--privileged=1` (or `t`, `True`…). Options are now read the way Docker, Podman and nerdctl read them, and a line that cannot be read with certainty is re-read word by word.
+- **A new line in `command`** started a second command that was not analysed.
+- **CI log commands**: reports print file and server names taken from the scanned repository. A name such as `::error::…` at the start of a line, or `##[…]` (GitHub Actions) and `##vso[…]` (Azure Pipelines) anywhere in a line, could be run as a command by the CI runner (fake annotations, hidden log output, step outputs). Under GitHub Actions the text report is now printed between `::stop-commands::` markers with a random token, report lines never start with `::`, and `##` is neutralised in every format (`#\x23` in text; `#\u0023` in JSON and SARIF, which decodes to the same text).
+- Found in the new features of this release before publication: `#` inside a word was taken for a comment in shell scripts, commands after `call` / `start` (cmd), in backquotes or in `$(…)` were skipped, and a script longer than the analysis limit was cut silently (now reported as CW100). In `.configwarden-ignore`, lines were also split on characters that editors and GitHub do not show as line breaks (U+2028, U+0085, `\x0c`…), so an exception could hide in what looks like a comment; a line with a control or invisible character is now refused, a secret written in a reason is masked, and folder exceptions are matched in linear time on very deep paths. The GitHub Action stopped before printing the text report when findings were written to SARIF (GitHub runs steps with `bash -e`), and the pre-commit hook did not run when only non-JSON files were committed.
+
 ### Added
+- **Exceptions file `.configwarden-ignore`**: accept a finding on purpose, one line per exception: a rule ID, a file or a folder ending with `/`, an optional end date (`until=YYYY-MM-DD`) and a mandatory reason after ` -- `. No wildcard and never the whole project. Suppressed findings no longer fail the scan but are always listed at the end of the text report and in the JSON report (`suppressed`, with the reason), so a repository cannot hide its own dangerous configuration without it showing. They are left out of SARIF reports, since GitHub Code Scanning ignores SARIF suppressions (their number is kept in `runs[0].properties.suppressedResults`). Malformed, expired and unused lines are reported by line number, never by content. The project's file is not read through a symbolic link nor above 256 KB. New options: `--no-ignore` and `--ignore-file FILE` (a file you trust, for example outside a repository under review).
+- **GitHub Action** (`uses: Matadi-afk/configwarden@<commit-sha>`): inputs `path`, `fail-on`, `exclude`, `sarif-file` and `no-ignore`. Nothing is installed or downloaded: configwarden runs from the action's own code, at the commit you pin, in Python's isolated mode, so the scanned repository cannot replace its modules. Inputs go through environment variables and are validated, never pasted into the script. No token or permission needed.
+- **pre-commit hook** (`id: configwarden`): runs on every commit and scans the whole repository, so a dangerous MCP configuration or a secret in any file blocks the commit.
 - **CW111 (medium)**: container image run by `docker run`, `podman run` or `nerdctl run` without a digest or an exact version. Reported: no tag (Docker pulls `:latest`), `:latest`, `:main`, `:stable` and other floating tags, a tag without any digit (`:alpine`) and a major version only (`:20`, `:v1`). A digest (`@sha256:…`) is recommended; an exact version (`:1.2.3`) is accepted. Docker Hub official images (`node`, `python`) and local registries (`localhost:5000/…`) are not reported, since no one else can publish there. Global options, grouped short options (`-it`, `-eKEY=V`) and `docker container run` are understood; an unknown option stops the analysis instead of guessing. Measured on 3,099 published configuration examples: 85 of the 110 `docker run` lines are affected.
 
 ### Changed
+- **CW102 also checks extra packages**: `uvx --with pkg`, `uv run --with pkg` and a second `npx -p pkg` install more code from the registry, and must be pinned too (19 unpinned extra packages in 3,099 published examples). This includes `uv run --with "mcp[cli]" mcp run server.py`, the configuration written by `mcp install`: use `--with "mcp[cli]==<version>"`. A `--with a,b` list is split the way uv splits it (not inside `pkg[extra1,extra2]`, nor in a version range such as `pkg>=1,<2`).
+- **CW106 only reads the options placed before the image**: in `docker run image --privileged`, `--privileged` is an argument of the program inside the container, not a Docker option. If the command line cannot be read with certainty, the whole line is still checked.
 - **Every command of a shell script is now checked**, not only the first one. In `bash -c "cd /srv && npx -y server"`, only `cd /srv` was read: CW101 reported the script, but an unpinned package (CW102), an unverified source (CW107), a dangerous container (CW106) or an unpinned image (CW111) further down went unnoticed. Commands separated by `;`, `&&`, `||`, `|`, `&`, parentheses or a new line are read, in `bash -c`, `sh -c`, `su -c`, `cmd /c`, `pwsh -Command` and in a command line written in `command`; leading `VAR=value`, `exec`, `then`, `do`… are skipped, and the word after a redirection (`> file`) is not taken for a command. Limits: 20 extra commands per server, shared by nested scripts. On 3,099 published examples, 4 servers hid such a problem.
+
+### Fixed
+- Options written after the package belong to the server, not to the launcher: `npx -y server@1.2.3 -p 3000` reported `3000` as an unpinned package (CW102), and `uvx server==1.0 --from git+https://…` as an untrusted source (CW107).
+
+### Development
+- Property-based tests with Hypothesis (development dependency only, never installed for users): thousands of generated command lines, image names, JSON configurations and exception files check that the scan never crashes, never hits its internal error guard, stays fast on very long inputs, and that no secret or control character ever reaches a report. Exceptions are compared with a simple reference model.
+- `tests/test_npm_args.py` freezes npm's own answers for tricky `npx` and `npm exec` command lines.
+- The `.hypothesis` cache folder is skipped during a scan, like other cache folders.
 
 ## [0.3.0] - 2026-10-08
 
@@ -105,7 +128,8 @@ Three issues found during an internal security review of agentguard itself. They
 - Text, JSON and SARIF 2.1.0 reports; exit codes for CI.
 - Zero runtime dependencies; secrets are always redacted in reports.
 
-[Unreleased]: https://github.com/Matadi-afk/configwarden/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/Matadi-afk/configwarden/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/Matadi-afk/configwarden/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/Matadi-afk/configwarden/compare/v0.2.2...v0.3.0
 [0.2.2]: https://github.com/Matadi-afk/configwarden/compare/v0.2.1...v0.2.2
 [0.2.1]: https://github.com/Matadi-afk/configwarden/compare/v0.2.0...v0.2.1

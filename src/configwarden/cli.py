@@ -4,6 +4,7 @@ Exemples :
     configwarden scan .
     configwarden scan . --format sarif --output configwarden.sarif
     configwarden scan . --fail-on high --exclude "examples/*"
+    configwarden scan . --no-ignore          (sans le fichier d'exceptions)
     configwarden rules
 
 Codes de sortie (utiles en CI) :
@@ -18,8 +19,9 @@ import argparse
 import os
 import sys
 from pathlib import Path
+from secrets import token_hex
 
-from configwarden import __version__
+from configwarden import __version__, ignore
 from configwarden.models import Severity
 from configwarden.redact import sanitize
 from configwarden.reporters import RENDERERS
@@ -53,6 +55,17 @@ def _build_parser() -> argparse.ArgumentParser:
         default=[],
         metavar="GLOB",
         help='Glob to skip, repeatable (e.g. --exclude "tests/*").',
+    )
+    exceptions = scan_cmd.add_mutually_exclusive_group()
+    exceptions.add_argument(
+        "--no-ignore",
+        action="store_true",
+        help=f"Report everything: do not read {ignore.IGNORE_FILE_NAME}.",
+    )
+    exceptions.add_argument(
+        "--ignore-file",
+        metavar="FILE",
+        help=f"Read exceptions from FILE instead of <scanned folder>/{ignore.IGNORE_FILE_NAME}.",
     )
 
     sub.add_parser("rules", help="List all detection rules.")
@@ -110,10 +123,53 @@ def _protect_console() -> None:
             reconfigure(errors="backslashreplace")
 
 
+def _print_shielded(report: str, report_format: str) -> None:
+    """Affiche le rapport ; sous GitHub Actions, les commandes de workflow sont suspendues.
+
+    Sécurité : le rapport recopie des noms de fichiers et de serveurs du dépôt analysé.
+    Sur GitHub, une ligne « ::… » ou un « ##[…] » y serait exécuté par le runner (fausse
+    erreur, masquage, variable de sortie…). « ::stop-commands:: » suivi d'un jeton
+    imprévisible les désactive jusqu'au jeton de fin (méthode officielle de GitHub).
+    JSON et SARIF n'en ont pas besoin, et resteraient ainsi lisibles par un autre
+    programme (« … --format json | jq ») : aucune de leurs lignes ne commence par « :: »,
+    et leurs « ## » sont échappés (redact.json_for_logs).
+    """
+    if report_format != "text" or os.environ.get("GITHUB_ACTIONS") != "true":
+        print(report)
+        return
+    token = token_hex(16)
+    print(f"::stop-commands::{token}")
+    try:
+        print(report)
+    finally:
+        print(f"::{token}::")  # toujours : la suite du journal doit retrouver ses commandes
+
+
 def _cmd_rules() -> int:
     for rule in ALL_RULES:
         print(f"{rule.id}  [{rule.severity.value:<8}] {rule.title}")
     return EXIT_OK
+
+
+def _apply_exceptions(result, explicit: str | None) -> str | None:
+    """Applique le fichier d'exceptions ; renvoie un message d'erreur, ou None.
+
+    Le fichier du projet analysé n'est pas fiable (lien symbolique refusé) ; celui donné
+    par --ignore-file est choisi par l'utilisateur, donc fiable.
+    """
+    known = [rule.id for rule in ALL_RULES]
+    if explicit:
+        path = Path(explicit)
+        if not path.exists():
+            return f"ignore file not found: {sanitize(explicit)}"
+        loaded = ignore.read(path, sanitize(path.name), known, trusted=True)
+    else:
+        path = Path(result.root) / ignore.IGNORE_FILE_NAME
+        if not os.path.lexists(path):
+            return None
+        loaded = ignore.read(path, ignore.IGNORE_FILE_NAME, known, trusted=False)
+    ignore.apply(result, loaded)
+    return None
 
 
 def _cmd_scan(args: argparse.Namespace) -> int:
@@ -122,6 +178,16 @@ def _cmd_scan(args: argparse.Namespace) -> int:
     except FileNotFoundError as error:
         print(f"configwarden: error: {sanitize(str(error))}", file=sys.stderr)
         return EXIT_ERROR
+
+    if not args.no_ignore:
+        problem = _apply_exceptions(result, args.ignore_file)
+        if problem:
+            print(f"configwarden: error: {problem}", file=sys.stderr)
+            return EXIT_ERROR
+    if args.format != "text":
+        # Le rapport texte les affiche ; pour JSON et SARIF, elles vont dans les journaux.
+        for note in result.ignore_notes:
+            print(note, file=sys.stderr)
 
     to_file = bool(args.output)
     report = RENDERERS[args.format](result, color=not to_file and _use_color(sys.stdout))
@@ -133,9 +199,10 @@ def _cmd_scan(args: argparse.Namespace) -> int:
             print(f"configwarden: error: {sanitize(str(error))}", file=sys.stderr)
             return EXIT_ERROR
         shown = sanitize(args.output)
-        print(f"Report written to {shown} ({len(result.findings)} finding(s)).")
+        hidden = f", {len(result.suppressed)} suppressed" if result.suppressed else ""
+        print(f"Report written to {shown} ({len(result.findings)} finding(s){hidden}).")
     else:
-        print(report)
+        _print_shielded(report, args.format)
 
     threshold = Severity(args.fail_on).rank
     failing = any(f.severity.rank >= threshold for f in result.findings)
