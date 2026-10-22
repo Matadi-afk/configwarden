@@ -175,7 +175,9 @@ def scan(target: str | Path, excludes: Iterable[str] = ()) -> ScanResult:
         # rangent leurs serveurs dans des fichiers aux noms génériques (settings.json…).
         mcp_named = mcp.is_mcp_config(relative)
         if mcp_named or mcp.is_json_file(relative):
-            result.findings.extend(mcp.check_text(text, rel_str, mcp_named=mcp_named))
+            result.findings.extend(
+                mcp.check_text(text, rel_str, mcp_named=mcp_named, folder=path.parent.name)
+            )
 
     # Tri : le plus grave d'abord, puis par fichier et ligne.
     result.findings.sort(key=lambda f: (-f.severity.rank, f.path, f.line, f.rule.id))

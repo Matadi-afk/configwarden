@@ -50,7 +50,8 @@ CAFILE = ["--cafile", "/etc/ssl/certs/ca.pem"]
         (["--no-registry", "github:attacker/evil", "srv@1.0.0"], ["CW107"]),
         # Cas sains : rien ne doit changer.
         (["-y", "srv@1.2.3", "-c", "config.json"], []),
-        (["-y", "--registry", "https://registry.example.com", "srv@1.2.3"], []),
+        # Registre non officiel : signalé par CW112 depuis le 21 octobre 2026.
+        (["-y", "--registry", "https://registry.example.com", "srv@1.2.3"], ["CW112"]),
         (["-y", "--", "srv@1.2.3", "--call", "x"], []),
     ],
 )

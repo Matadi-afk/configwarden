@@ -422,7 +422,11 @@ def test_ag107_shows_only_the_origin_of_the_url(write_mcp, capsys, args) -> None
 )
 def test_option_values_are_not_taken_for_the_package(write_mcp, command, args) -> None:
     findings = scan(write_mcp({"s": {"command": command, "args": args}})).findings
-    assert findings == []
+    # Depuis le 21 octobre 2026, un registre non officiel est signalé (CW112), sans que
+    # le jeton de son adresse apparaisse ; la valeur de l'option n'est jamais lue comme
+    # un paquet (pas de CW102 ni de CW107).
+    assert {f.rule.id for f in findings} <= {"CW112"}
+    assert not any(FAKE_TOKEN in f.message for f in findings)
 
 
 def test_uvx_with_git_dependency_is_flagged(write_mcp) -> None:

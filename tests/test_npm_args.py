@@ -1,16 +1,22 @@
 """Tests de npm_args.py : la lecture de `npx` et de `npm exec` est celle de npm lui-même.
 
-Chaque cas ci-dessous a été donné à npm 10.9.4 (bin/npx-cli.js, puis nopt 8.1.0) le
-20 octobre 2026, et sa réponse est figée ici. Avant d'être figée, la lecture Python a été
-comparée à celle de npm sur plus de 50 000 lignes tirées au hasard : aucune différence.
+Chaque cas ci-dessous a été donné à npm 10.9.4 (bin/npx-cli.js, puis nopt 8.1.0) les
+20 et 21 octobre 2026, et sa réponse est figée ici. Avant d'être figée, la lecture Python a
+été comparée à celle de npm sur plus de 180 000 lignes tirées au hasard : aucune
+différence (le 21 octobre, cette comparaison élargie a trouvé et fait corriger deux écarts :
+« --no-depth 1 » avale le nombre, et nopt retire les espaces autour d'une valeur).
 
 Quelques surprises de npm, toutes vérifiées :
 - `--cal x` n'est pas l'abréviation de `--call` : c, a et l sont trois raccourcis d'une
   lettre, donc `--cal` vaut `--call --all --long` (et `--call` n'a plus de valeur) ;
 - `npx --browser srv -c "…"` : `--browser` avale le « -- » placé par npx, et `-c`
   redevient une option ;
-- pour `npm` (sans x), `-p` est `--parseable`, pas `--package`.
+- pour `npm` (sans x), `-p` est `--parseable`, pas `--package` ;
+- `npx --no-depth 1 paquet` : « 1 » est la valeur de `--no-depth`, et c'est `paquet` qui
+  est lancé.
 """
+
+from dataclasses import replace
 
 import pytest
 
@@ -68,6 +74,21 @@ NPX_CASES = [
     # occurrence active suffit pour signaler le mode shell.
     (["--shell-mode", "--shell-mode=false", "echo hi"], None, [], ["echo hi"], True),
     (["--shell-mode=false", "echo hi"], None, [], ["echo hi"], False),
+    # Un nombre après une option numérique niée est sa valeur : c'est github:… qui est lancé.
+    (["--no-depth", "1", "github:attacker/evil"], None, [], ["github:attacker/evil"], False),
+    (["-c", " "], "", [], [], False),  # nopt retire les espaces : pas de ligne de commande
+    (["--call", " touch x "], "touch x", [], [], False),
+]
+
+# (arguments de npx, registres retenus par npm : (option, adresse))
+REGISTRY_CASES = [
+    (
+        ["--registry", "https://registry.example.com", "srv@1.2.3"],
+        [("registry", "https://registry.example.com")],
+    ),
+    (["--@myorg:registry=https://r.example", "srv"], [("@myorg:registry", "https://r.example")]),
+    (["--reg", "--registry=https://r.example", "srv"], []),  # « --registry=… » avalé, rejeté
+    (["-y", "srv", "--registry", "https://r.example"], []),  # option du serveur
 ]
 
 # (arguments de npm, lecture de `npm exec` : (call, paquets, commande), ou None)
@@ -102,7 +123,15 @@ NPM_CASES = [
 @pytest.mark.parametrize(("args", "call", "packages", "command", "shell_mode"), NPX_CASES)
 def test_npx_is_read_like_npm(args, call, packages, command, shell_mode) -> None:
     reading = parse_npx(args)
-    assert reading == NpxArguments(call, packages, command, shell_mode)
+    assert replace(reading, registries=[]) == NpxArguments(call, packages, command, shell_mode)
+    assert parse_npx(reading.as_npx_args()) == reading
+
+
+@pytest.mark.parametrize(("args", "registries"), REGISTRY_CASES)
+def test_registries_are_read_like_npm(args, registries) -> None:
+    # npm écrit l'adresse sous sa forme normalisée (« …com/ ») : seul l'hôte compte ici.
+    reading = parse_npx(args)
+    assert [(key, address.rstrip("/")) for key, address in reading.registries] == registries
     assert parse_npx(reading.as_npx_args()) == reading
 
 

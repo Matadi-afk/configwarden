@@ -29,7 +29,7 @@ configwarden scan .
 git clone https://github.com/Matadi-afk/configwarden
 cd configwarden
 pip install .
-configwarden scan examples/vulnerable-mcp   # 15 findings
+configwarden scan examples/vulnerable-mcp   # 18 findings
 configwarden scan examples/safe-mcp         # the fixed version: no issues
 ```
 
@@ -42,7 +42,7 @@ configwarden scan examples/safe-mcp         # the fixed version: no issues
     mcp.json:26  Server 'sandbox' runs a container with a mount of '/var/run/docker.sock'.
     Fix: Remove --privileged, host namespaces and mounts of '/', the home directory or the Docker socket. ...
 
-Scanned 3 file(s), skipped 0. 15 finding(s): 0 critical, 12 high, 3 medium, 0 low.
+Scanned 4 file(s), skipped 0. 18 finding(s): 0 critical, 13 high, 5 medium, 0 low.
 ```
 
 Every value in `examples/` is a fake placeholder, and the example files are named so that no AI client loads them.
@@ -64,6 +64,8 @@ Every value in `examples/` is a fake placeholder, and the example files are name
 | CW109 | high | AI client set to approve everything: Claude Code `enableAllProjectMcpServers` or `bypassPermissions`, VS Code `chat.tools.global.autoApprove`, Zed, Cursor `*:*`, Kiro Autopilot |
 | CW110 | high | TLS certificate checks turned off: `NODE_TLS_REJECT_UNAUTHORIZED=0`, `*_SSL_VERIFY=false`, `--insecure`, `--strict-ssl=false`, `--allow-insecure-host` |
 | CW111 | medium | Container image run by `docker run`, `podman run` or `nerdctl run` without a digest or an exact version: no tag, `:latest`, `:main`, `:stable`, a major version only (`:20`); Docker Hub official images (`node`) and local registries are ignored |
+| CW112 | high | Environment that changes what really runs: code loaded through `NODE_OPTIONS=--require`, `LD_PRELOAD`, `BASH_ENV`, a Java agent…, a debugger port (`--inspect`), or a non-official package registry (`PIP_INDEX_URL`, `npm_config_registry`, `npx --registry`, `uvx --index-url`), in a server's `env`, in Claude Code settings or on the command line |
+| CW113 | medium | Command run automatically by the AI client or the editor: hooks (Claude Code, Gemini CLI, Cursor, Copilot CLI, Windsurf, Kiro), Claude Code `statusLine` / `apiKeyHelper`…, MCP `headersHelper`, VS Code tasks with `"runOn": "folderOpen"`, dev container `initializeCommand` (the way the Shai-Hulud worm reinstalls itself) |
 
 Commands hidden later in a shell script (`bash -c "cd /srv && npx -y server"`) are checked too.
 
@@ -81,7 +83,9 @@ configwarden reads every `.json` / `.jsonc` file (comments and trailing commas a
 | VS Code | `servers` in `.vscode/mcp.json`, `mcp.servers` in settings, `devcontainer.json` customizations |
 | Zed | `context_servers` in `settings.json` |
 
-Other JSON files are only reported when they contain MCP servers. YAML (Continue) and TOML (Codex CLI) configurations are not supported yet.
+Commands that run automatically (CW113) are found in hooks files (`.claude/settings.json`, `.cursor/hooks.json`, `.gemini/settings.json`, `.github/hooks/*.json`, `.windsurf/hooks.json`, `.kiro/hooks/*.json`), in `.vscode/tasks.json` and in `devcontainer.json`.
+
+Other JSON files are only reported when they contain MCP servers or such commands. YAML (Continue) and TOML (Codex CLI) configurations are not supported yet.
 
 Wrapped commands are unwrapped before being checked: `cmd /c npx …`, `wsl …`, `env VAR=1 …` (and `env -S`), `sudo …`, `uv run …`, `pnpm exec …` and `bash -c "…"` are all analysed for the program they really start.
 

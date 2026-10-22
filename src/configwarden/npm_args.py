@@ -262,9 +262,20 @@ _NPX_OPTS = _REMOVED_OPTS | {
 # lib/utils/cmd-list.js : seuls ces mots mènent à `npm exec` (alias « x », abréviation « exe »).
 _NPM_EXEC_COMMANDS = frozenset({"exec", "exe", "x"})
 _SINGLES = frozenset(key for key in _SHORTHANDS if len(key) == 1)
+_URL_START = re.compile(r"[A-Za-z][A-Za-z0-9+.-]*:.")
 _ONLY_DASHES = re.compile(r"-{2,}")
 _SINGLE_DASH_WORD = re.compile(r"-[^-]")
 _DASH_WORD = re.compile(r"-{1,2}[^-]+")
+_DOUBLE_DASH_WORD = re.compile(r"-{2,}[^-]")
+# Ce que `isNaN()` de JavaScript accepte comme nombre (« --no-depth 1 » prend « 1 »).
+_JS_NUMBER = re.compile(
+    r"[+-]?(?:Infinity|(?:[0-9]+\.?[0-9]*|\.[0-9]+)(?:[eE][+-]?[0-9]+)?)"
+    r"|0[xX][0-9a-fA-F]+|0[oO][0-7]+|0[bB][01]+"
+)
+_JS_SPACES = (  # espaces retirés par trim() et Number() de JavaScript
+    "\t\n\x0b\x0c\r \xa0\u1680\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008"
+    "\u2009\u200a\u2028\u2029\u202f\u205f\u3000\ufeff"
+)
 
 
 def _abbreviations(words: Iterable[str]) -> dict[str, str]:
@@ -295,6 +306,8 @@ class NpxArguments:
     packages: list[str] = field(default_factory=list)  # valeurs de `--package` / `-p`
     command: list[str] = field(default_factory=list)  # commande lancée et ses arguments
     shell_mode: bool = False  # `pnpm dlx --shell-mode` : la commande est une ligne de shell
+    # Registres demandés (`--registry`, `--@scope:registry`) : (option, adresse), pour CW112.
+    registries: list[tuple[str, str]] = field(default_factory=list)
 
     def shell_option(self) -> str | None:
         """L'option qui fait lancer une ligne de commande par un shell, ou None."""
@@ -314,6 +327,7 @@ class NpxArguments:
             words.append(f"--call={self.call}")
         if self.shell_mode:
             words.append("--shell-mode")
+        words += [f"--{key}={address}" for key, address in self.registries]
         return [*words, "--", *self.command]
 
 
@@ -380,6 +394,11 @@ def _npx_prepass(args: list[str]) -> list[str]:
             if consumed is not None and not removed:
                 out.append(consumed)
     return out
+
+
+def _is_js_number(text: str) -> bool:
+    stripped = text.strip(_JS_SPACES)
+    return not stripped or _JS_NUMBER.fullmatch(stripped) is not None
 
 
 def _resolve_short(word: str) -> tuple[str, ...] | None:
@@ -458,6 +477,11 @@ def _nopt(argv: list[str]) -> tuple[dict[str, object], list[str]]:
                 and (
                     ("lit:" + lookahead) in parts
                     or (lookahead == "null" and "null" in parts)
+                    or (
+                        not _DOUBLE_DASH_WORD.match(lookahead)
+                        and _is_js_number(lookahead)
+                        and "Number" in parts
+                    )
                     or (not _SINGLE_DASH_WORD.match(lookahead) and "String" in parts)
                 )
             ):
@@ -479,10 +503,11 @@ def _nopt(argv: list[str]) -> tuple[dict[str, object], list[str]]:
 
 
 def _as_text(value: object) -> str | None:
-    """Comme `nopt.clean` pour une option texte : un booléen devient « true » / « false »."""
+    """Comme `nopt.clean` pour une option texte : un booléen devient « true » / « false »,
+    et les espaces au début et à la fin sont retirés."""
     if isinstance(value, bool):
         return "true" if value else "false"
-    return value if isinstance(value, str) else None
+    return value.strip(_JS_SPACES) if isinstance(value, str) else None
 
 
 def _as_list(value: object) -> list[object]:
@@ -500,6 +525,15 @@ def _arguments(data: dict[str, object], command: list[str]) -> NpxArguments:
         command=command,
         # Par prudence, une seule occurrence suffit (`--shell-mode=false --shell-mode`).
         shell_mode=any(_as_text(item) == "true" for item in _as_list(data.get("shell-mode"))),
+        registries=[
+            (key, text)
+            for key, value in data.items()
+            if key == "registry" or (key.startswith("@") and key.endswith(":registry"))
+            for item in _as_list(value)
+            if (text := _as_text(item)) not in (None, "", "true", "false")
+            # nopt écarte une valeur de `--registry` qui n'est pas une adresse (« schéma:… »).
+            and (key != "registry" or _URL_START.match(text) is not None)
+        ],
     )
 
 

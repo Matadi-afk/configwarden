@@ -24,6 +24,8 @@ from __future__ import annotations
 
 import json
 import re
+import sys
+from collections.abc import Iterable, Iterator
 from pathlib import PurePosixPath
 from urllib.parse import unquote, urlparse
 
@@ -31,6 +33,7 @@ from configwarden import commands, containers, jsonc, values
 from configwarden.models import Finding, Rule, Severity
 from configwarden.npm_args import parse_npx
 from configwarden.redact import redact, redact_url, url_origin
+from configwarden.rules.secrets import mask_secrets
 
 # --- Définition des règles -----------------------------------------------------
 
@@ -162,6 +165,37 @@ UNPINNED_CONTAINER_IMAGE = Rule(
     ),
 )
 
+# CW112 (décision du 21 octobre 2026) : une variable d'environnement, ou une option du
+# lanceur, qui change ce qui s'exécute vraiment. C'est le même contournement que ceux de
+# la revue de la 0.4.0, par un autre chemin : du code chargé en plus, ou des paquets
+# pris ailleurs que dans le registre officiel.
+UNSAFE_ENVIRONMENT = Rule(
+    id="CW112",
+    title="MCP server environment changes what really runs",
+    severity=Severity.HIGH,
+    remediation=(
+        "Remove the variable or option. Code loaded through NODE_OPTIONS (--require, --import), "
+        "LD_PRELOAD, BASH_ENV or a Java agent runs inside every program the server starts, "
+        "and a replaced package registry can serve modified packages. If you really use a "
+        "private registry or mirror, accept it explicitly in .configwarden-ignore."
+    ),
+)
+
+# CW113 (décision du 21 octobre 2026, gravité moyenne) : une commande que l'outil IA ou
+# l'éditeur lance tout seul (hooks, tâche à l'ouverture du dossier, initializeCommand).
+# C'est ainsi que le ver Shai-Hulud se réinstalle dans les projets de ses victimes.
+AUTO_RUN_COMMAND = Rule(
+    id="CW113",
+    title="Command runs automatically when the project is used",
+    severity=Severity.MEDIUM,
+    remediation=(
+        "Check what the command does and who added it. A repository can make your AI client or "
+        "editor run a program as soon as the project is opened or the agent acts (hooks, tasks "
+        "run on folder open, dev container initializeCommand): this is how the Shai-Hulud worm "
+        "reinstalls itself. Remove it, or accept it in .configwarden-ignore after review."
+    ),
+)
+
 RULES = [
     INVALID_CONFIG,
     SHELL_EXECUTION,
@@ -175,6 +209,8 @@ RULES = [
     CLIENT_AUTO_APPROVE,
     INSECURE_TLS,
     UNPINNED_CONTAINER_IMAGE,
+    UNSAFE_ENVIRONMENT,
+    AUTO_RUN_COMMAND,
 ]
 
 # --- Constantes de détection ---------------------------------------------------
@@ -214,6 +250,9 @@ _CLIENT_FOLDERS = {
 # Clés qui annoncent des serveurs MCP. Cherchées dans le texte brut d'un fichier
 # JSON abîmé, après décodage des échappements « \\uXXXX ».
 _MCP_MARKERS = ('"mcpServers"', '"context_servers"', '"mcp"')
+# Clés de commandes automatiques (CW113) : un fichier abîmé qui les contient est signalé,
+# car VS Code et d'autres outils lisent leurs fichiers avec tolérance.
+_AUTO_RUN_MARKERS = ('"hooks"', '"runOn"', '"initializeCommand"')
 _UNICODE_ESCAPE = re.compile(r"\\u([0-9a-fA-F]{4})")
 # Clés qui désignent l'adresse d'un serveur distant, selon l'outil.
 _URL_KEYS = ("url", "serverUrl", "httpUrl")
@@ -433,6 +472,142 @@ _UV_EXACT_VERSION = re.compile(
     r"\s*[A-Za-z0-9._-]+(?:\[[^\]]*\])?\s*(?:===?|@)\s*v?\d[0-9A-Za-z.+!-]*\s*"
 )
 
+# CW112 : variables qui font charger du code en plus (noms comparés en majuscules :
+# Windows ne distingue pas la casse).
+_PRELOAD_VARIABLES = {
+    "LD_PRELOAD": "preloads a library into every program it starts",
+    "LD_AUDIT": "loads an audit library into every program it starts",
+    "DYLD_INSERT_LIBRARIES": "preloads a library into every program it starts",
+    "BASH_ENV": "runs a script every time bash starts",
+    "DOTNET_STARTUP_HOOKS": "loads a .NET startup hook",
+    "NPM_CONFIG_SCRIPT_SHELL": "replaces the shell that runs npm scripts",
+    "YARN_YARN_PATH": "runs another Yarn program instead of Yarn (yarnPath)",
+}
+_NODE_OPTIONS_VARIABLES = {"NODE_OPTIONS", "NPM_CONFIG_NODE_OPTIONS"}
+_NODE_CODE_OPTIONS = {"-r", "--require", "--import", "--loader", "--experimental-loader"}
+_NODE_DEBUG_OPTIONS = {"--inspect", "--inspect-brk", "--inspect-wait"}
+_JAVA_OPTIONS_VARIABLES = {"JAVA_TOOL_OPTIONS", "_JAVA_OPTIONS", "JDK_JAVA_OPTIONS"}
+_JAVA_AGENT = re.compile(
+    r"(?:^|\s)(-javaagent|-agentpath|-agentlib|-XX:OnError|-XX:OnOutOfMemoryError)[:=]"
+)
+# Git : GIT_SSH_COMMAND est lu par un shell. « ssh -i clé » est normal ; un autre programme
+# ou des caractères de shell ne le sont pas.
+_SHELL_CHARACTERS = frozenset(";&|`$<>()\n{}*?[")
+# Une ligne de plus de 10 000 caractères ou de 100 mots n'est pas lue en entier : on la signale
+# plutôt que d'ignorer la fin (revue de l'Auditeur, 4e passe).
+_SSH_LINE_LIMIT = 10_000
+# Variables que le shell (GIT_SSH_COMMAND, par git) ou bash (BASH_ENV) développent eux-mêmes :
+# « $X » y désigne une autre variable, que le bloc « env » a pu remplir. Seule la référence à la
+# variable elle-même (« ${GIT_SSH_COMMAND} », le réglage de l'utilisateur transmis tel quel) est
+# écartée. GIT_SSH (le programme que git lance à la place de ssh) n'est développé par personne : sa
+# valeur est le nom exact du fichier, lue ici sans rien en retirer (revue de l'Auditeur, 10e passe).
+_SHELL_READ_VARIABLES = ("GIT_SSH_COMMAND", "GIT_SSH", "BASH_ENV")
+# Dossiers des programmes du système (hors du projet). Pas « /usr/src », « /opt/app », « /home »,
+# « /tmp » ni « /proc » : un projet peut y être (conteneur, poste) ou s'y atteindre
+# (« /proc/self/cwd »). Revue de l'Auditeur, 5e passe.
+_SYSTEM_PREFIXES = (
+    "/usr/bin/", "/usr/sbin/", "/usr/local/bin/", "/usr/local/sbin/", "/usr/local/opt/",
+    "/usr/local/Cellar/", "/bin/", "/sbin/", "/opt/homebrew/", "/opt/local/bin/", "/etc/",
+    "/Applications/", "/usr/games/", "/usr/local/games/", "/snap/bin/", "/nix/store/",
+    "/nix/var/nix/profiles/", "/run/current-system/sw/bin/", "/usr/local/go/bin/",
+    "/opt/X11/bin/", "/System/Cryptexes/App/usr/bin/", "/Library/Apple/usr/bin/",
+)  # fmt: skip
+# Dossiers d'outils de l'utilisateur (gestionnaires de versions, installations locales) : un
+# dossier caché, « bin » ou « go/bin ». Pas « ~/projet » : le projet y est cloné par défaut.
+_USER_TOOLS = re.compile(r"(?:/Users/[^/]+|/home/[^/]+|/root)/(?:\.[^/]|bin/|go/bin/)")
+_HOME_TOOLS = re.compile(r"(?:~|\$HOME|\$\{HOME\})/(?:\.[^/]|bin/|go/bin/)")
+# Windows, seulement quand le scanner y tourne (voir `_on_windows`).
+_SYSTEM_WINDOWS = re.compile(
+    r"[A-Za-z]:[\\/](?:Windows|Program Files(?: \(x86\))?)(?:[\\/]|$)", re.I
+)
+_USER_TOOLS_WINDOWS = re.compile(
+    r"[A-Za-z]:[\\/]Users[\\/][^\\/]+[\\/]"
+    r"(?:\.[^\\/]|AppData[\\/]|scoop[\\/]|bin[\\/]|go[\\/]bin[\\/])",
+    re.I,
+)
+_PATH_SELF = frozenset({"$PATH", "${PATH}", "%PATH%"})
+# Références à une variable : « ${X} », « ${env:X} », « $X », « %X% », « $env:X » ; avec valeur par
+# défaut (« ${X:-…} ») pour la seconde forme.
+_PLAIN_REFERENCE = re.compile(
+    r"\$\{(?:(?i:env):)?(?P<a>[A-Za-z_][A-Za-z0-9_]*)\}|\$(?i:env):(?P<d>[A-Za-z_][A-Za-z0-9_]*)"
+    r"|%(?P<c>[A-Za-z_][A-Za-z0-9_]*)%|\$(?P<b>[A-Za-z_][A-Za-z0-9_]*)"
+)
+_DEFAULTED_NAME = re.compile(
+    r"\$\{(?P<name>[A-Za-z_][A-Za-z0-9_]*):?[-=](?P<default>.*)\}", re.DOTALL
+)
+# Toute référence à lire dans un texte. « ${…} » : npm lit son contenu entier comme un nom
+# (« ${a-b} », « ${a.b} »), un shell seulement le début (« a », puis une valeur par défaut) ; on
+# essaie les deux, quelle que soit la longueur du nom. Ni « { » ni « } » dedans (npm fait de même :
+# seule la référence la plus intérieure compte) : chaque « ${ » s'arrête à l'accolade suivante, donc
+# « ${A:-${A:-… » répété se relit en temps linéaire (avec « [^}]* », il était quadratique).
+_REFERENCE_IN_TEXT = re.compile(
+    r"\$\{(?P<g>[^{}]+)\}|\$(?i:env):(?P<d>[A-Za-z_][A-Za-z0-9_]*)"
+    r"|%(?P<c>[A-Za-z_][A-Za-z0-9_]*)%|\$(?P<b>[A-Za-z_][A-Za-z0-9_]*)"
+)
+_BRACED_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+# Une espace que le shell ne coupe pas (il ne coupe que « ' ', tabulation, saut de ligne »).
+_UNUSUAL_SPACE = re.compile(r"[^\S \t\n]")
+# « ${X:-défaut} », « ${X-défaut} », « ${X:=défaut} », « ${X=défaut} » et « ${X:+valeur} » (X
+# définie : sa valeur de remplacement) n'importe où dans un texte.
+# Pas d'accolade dans le défaut : seule la référence la plus intérieure se lit à chaque tour, donc
+# un texte piégé (« ${A:-${A:-… ») se relit en temps linéaire.
+_DEFAULT_IN_TEXT = re.compile(r"\$\{[A-Za-z_]\w*:?[-=+]([^{}]*)\}")
+# « ${…} » comme Claude Code le développe : /\$\{([^}]+)\}/g, le contenu coupé au premier « :- » (le
+# nom peut être n'importe quoi, le défaut s'arrête à la première « } »). Voir `_client_reading`.
+_CLIENT_REFERENCE = re.compile(r"\$\{([^}]+)\}")
+_URL_SCHEME = re.compile(r"[A-Za-z][A-Za-z0-9+.\-]{0,31}://")
+# Limites du suivi des références (voir `_known_expansions`).
+_MAX_EXPANSIONS = 64
+_MAX_EXPANDED_LENGTH = 20_000
+_MAX_REFERENCE_DEPTH = 8
+_MAX_DEFINITIONS = 8
+_MAX_REPEAT = 3  # une variable n'est remplacée que 3 fois le long d'un chemin (A=${B}, B=${A})
+_MAX_READING = 400_000  # caractères relus au total pour un même ensemble de variables
+# « $HOME » et « ${HOME} » seuls ne lancent rien. Toute autre variable (« $OPTS ») peut contenir
+# des options ou des mots, et « $IFS » les couper : elles restent signalées.
+_HOME_REFERENCE = re.compile(r"\$(?:HOME(?![A-Za-z0-9_])|\{HOME\})")
+# « "~/x" », « ~"/x" », « \~/x », « '$HOME/x' » : le shell ne les développe pas, c'est un chemin
+# relatif, donc un dossier du projet (revue de l'Auditeur, 6e passe).
+_UNEXPANDED_HOME = re.compile(r"""["'\\]~|~["'\\]|\\\$|'[^']*\$\{?HOME""")
+# Options de ssh qui lancent un programme ou chargent une bibliothèque, et la valeur qui les
+# désactive.
+_SSH_PROGRAM_OPTIONS = {
+    "proxycommand": "ProxyCommand",
+    "localcommand": "LocalCommand",
+    "knownhostscommand": "KnownHostsCommand",
+    "pkcs11provider": "PKCS11Provider",
+    "securitykeyprovider": "SecurityKeyProvider",
+    "xauthlocation": "XAuthLocation",  # lancé quand le transfert X11 est actif
+}
+_SSH_OFF_VALUES = {
+    "ProxyCommand": ("none",),
+    "PKCS11Provider": ("none",),
+    "SecurityKeyProvider": ("internal",),
+}
+_SSH_LETTERS_WITH_ARGUMENT = frozenset("BbcDEeFIiJLlmOPpQRSWw")
+# Perl : « -M », « -m » (module) et « -d » (débogueur), seuls ou groupés (« -wMx »).
+_PERL_MODULE = re.compile(r"(?:^|\s)-[CDITUWtw]*([Mmd])")
+# Ruby : « -r » charge une bibliothèque, avec ou sans tiret (« RUBYOPT=rubygems »).
+_RUBY_REQUIRE = re.compile(r"(?:^|\s)-?[CEIKTWadlsvwx0-9]*r")
+# CW112 : variables qui remplacent la source des paquets.
+_REGISTRY_VARIABLES = {
+    "PIP_INDEX_URL", "PIP_EXTRA_INDEX_URL", "PIP_FIND_LINKS", "UV_INDEX_URL", "UV_DEFAULT_INDEX",
+    "UV_EXTRA_INDEX_URL", "UV_INDEX", "UV_FIND_LINKS", "NPM_CONFIG_REGISTRY",
+    "YARN_NPM_REGISTRY_SERVER", "YARN_REGISTRY", "BUN_CONFIG_REGISTRY",
+}  # fmt: skip
+_NPM_SCOPED_REGISTRY = re.compile(r"NPM_CONFIG_@[^:\s]{1,214}:REGISTRY")
+# Registres officiels : pas d'alerte (test.pypi.org n'en fait pas partie : tout le monde
+# peut y publier).
+_OFFICIAL_REGISTRIES = {
+    "pypi.org", "pypi.python.org", "files.pythonhosted.org", "registry.npmjs.org",
+    "registry.yarnpkg.com",
+}  # fmt: skip
+# Options des lanceurs Python qui remplacent l'index des paquets.
+_PYTHON_INDEX_OPTIONS = {
+    "--index-url", "-i", "--default-index", "--extra-index-url", "--index", "--find-links", "-f",
+}  # fmt: skip
+_MAX_INDEX_ENTRIES = 20
+
 # CW108 : clés qui autorisent des outils sans confirmation, selon le client IA.
 _AUTO_APPROVE_KEYS = ("alwaysAllow", "autoApprove")
 
@@ -489,9 +664,10 @@ def symlinked_config_finding(path: str) -> Finding:
 
 
 def _mentions_mcp(text: str) -> bool:
-    """Le texte brut annonce-t-il des serveurs MCP (même avec des échappements) ?"""
+    """Le texte brut annonce-t-il des serveurs MCP ou des commandes automatiques (même avec
+    des échappements) ?"""
     decoded = _UNICODE_ESCAPE.sub(lambda m: chr(int(m.group(1), 16)), text)
-    return any(marker in decoded for marker in _MCP_MARKERS)
+    return any(marker in decoded for marker in (*_MCP_MARKERS, *_AUTO_RUN_MARKERS))
 
 
 # Une chaîne JSON complète, puis le « : » qui en fait une clé. On parcourt les
@@ -634,6 +810,220 @@ def _auto_approve_settings(data: object) -> list[tuple[str, str]]:
             "(kiroAgent.agentAutonomy: Autopilot)",
         )
     return found
+
+
+_MAX_AUTO_RUNS = 100  # commandes automatiques signalées au plus, par fichier
+# Champs qui portent la commande d'un hook : Claude Code, Cursor, Gemini, Windsurf
+# (« command »), GitHub Copilot CLI (« bash », « powershell », « exec »).
+_HOOK_COMMAND_FIELDS = ("command", "bash", "powershell", "exec")
+# Réglages de Claude Code qui lancent un programme, acceptés dans un fichier du projet
+# (documentation officielle, 21 octobre 2026).
+_CLAUDE_COMMAND_SETTINGS = {
+    "statusLine": "to draw its status line",
+    "subagentStatusLine": "to draw its status line",
+    "fileSuggestion": "to suggest files",
+    "apiKeyHelper": "to get its API key",
+    "awsAuthRefresh": "to refresh AWS credentials",
+    "awsCredentialExport": "to export AWS credentials",
+    "gcpAuthRefresh": "to refresh Google Cloud credentials",
+    "otelHeadersHelper": "to compute telemetry headers",
+}
+
+
+def _program(command: object) -> str | None:
+    """Le programme d'une commande (« curl -s x | sh » -> « curl »), jamais la ligne entière :
+    elle peut contenir un jeton. None si ce n'est pas une commande lisible et non vide."""
+    if isinstance(command, dict):
+        command = command.get("value")  # VS Code : {"value": "…", "quoting": "…"}
+    if isinstance(command, list):
+        first = next((word for word in command if isinstance(word, str) and word.strip()), None)
+    elif isinstance(command, str):
+        first = commands.program_word(command)
+    else:
+        return None
+    if not first:
+        return None
+    # Jamais ce qui suit un « = » (revue de l'Auditeur, 21 octobre) : « NOM=valeur » peut
+    # porter un jeton. Retiré avant `executable_name`, qui ne garderait que la fin d'un chemin.
+    first = first.partition("=")[0].strip()
+    if not first or _secret_like(first):
+        return commands.UNKNOWN_PROGRAM  # un jeton collé à la place de la commande
+    name = commands.executable_name(first) or first
+    # Seuls les noms de forme ordinaire sont montrés (revue de l'Auditeur, 4e passe) : un
+    # morceau de secret avec « : », « @ » ou « ! » ne ressemble à aucun jeton connu.
+    return name if _PROGRAM_NAME.fullmatch(name) else commands.UNKNOWN_PROGRAM
+
+
+# Un mot de 20 caractères ou plus, sans point, fait d'une seule suite de lettres, chiffres et
+# « _ + - » : un jeton bien plus souvent qu'un nom de programme (les scripts ont une extension).
+_TOKEN_LIKE = re.compile(r"[A-Za-z0-9_+-]{20,}")
+_PROGRAM_NAME = re.compile(r"[A-Za-z0-9_.-]{1,24}")
+
+
+def _secret_like(word: str) -> bool:
+    """Le mot (ou un des dossiers du chemin) ressemble-t-il à un secret ?"""
+    for part in (word, *re.split(r"[\\/]", word)):
+        if part and (
+            mask_secrets(part) != part or _TOKEN_LIKE.fullmatch(part) or part.startswith("eyJ")
+        ):
+            return True
+    return False
+
+
+def _is_claude_settings(path: str, folder: str = "") -> bool:
+    """Le fichier est-il un réglage de Claude Code (.claude/settings*.json) ?
+
+    Casse ignorée (macOS et Windows ne la distinguent pas). `folder` est le dossier réel du
+    fichier : un fichier analysé seul (« scan .claude/settings.json ») perd son dossier dans
+    le chemin affiché.
+    """
+    location = PurePosixPath(path)
+    name = location.name.lower()
+    if name == "managed-settings.json":
+        return True
+    parent = (location.parent.name or folder).lower()
+    return parent == ".claude" and name.startswith("settings") and name.endswith(".json")
+
+
+def _auto_run_commands(data: object, *, claude_settings: bool = False) -> list[tuple[str, str]]:
+    """CW113 : (clé pour le numéro de ligne, description) de chaque commande automatique.
+
+    Formats relevés dans la documentation officielle (Éclaireur, 21 octobre 2026) :
+    - « hooks » de Claude Code (.claude/settings*.json : événement -> [{matcher, hooks:
+      [{type: "command", command}]}]) et de Cursor (.cursor/hooks.json : événement ->
+      [{command}]) ;
+    - tâches de VS Code (.vscode/tasks.json) avec "runOptions": {"runOn": "folderOpen"} ;
+    - « initializeCommand » d'un conteneur de développement, lancé sur la machine hôte ;
+    - réglages qui lancent un programme (« statusLine », « apiKeyHelper »…), lus seulement
+      dans les fichiers de Claude Code (`claude_settings`) : ailleurs, « statusLine » peut être
+      un simple texte d'interface (fichier de traduction).
+    Un type inattendu est ignoré, jamais une cause de plantage ; le travail est borné.
+    """
+    if not isinstance(data, dict):
+        return []
+    found: list[tuple[str, str]] = []
+    seen: set[str] = set()
+
+    def flag(key: str, description: str) -> None:
+        if description not in seen and len(found) < _MAX_AUTO_RUNS:
+            seen.add(description)
+            found.append((key, description))
+
+    hooks = data.get("hooks")
+    events_by_program: dict[str, list[str]] = {}  # un constat par programme, pas par événement
+    budget = _MAX_AUTO_RUNS * 100  # gestionnaires examinés au plus : temps borné
+    if isinstance(hooks, dict):
+        for event, entries in list(hooks.items())[: _MAX_AUTO_RUNS * 10]:
+            if not isinstance(entries, list):
+                continue
+            for entry in entries[:_MAX_AUTO_RUNS]:
+                if not isinstance(entry, dict):
+                    continue
+                handlers = entry.get("hooks")
+                candidates = [entry, *(handlers if isinstance(handlers, list) else [])]
+                for handler in candidates[:_MAX_AUTO_RUNS]:
+                    budget -= 1
+                    if budget < 0:
+                        break
+                    if not isinstance(handler, dict) or handler.get("type", "command") != "command":
+                        continue
+                    program = next(
+                        (
+                            found_program
+                            for field_name in _HOOK_COMMAND_FIELDS
+                            if (found_program := _program(handler.get(field_name)))
+                        ),
+                        None,
+                    )
+                    if program and len(events_by_program) < _MAX_AUTO_RUNS:
+                        events = events_by_program.setdefault(program, [])
+                        if str(event) not in events and len(events) < _MAX_AUTO_RUNS:
+                            events.append(str(event))
+    elif isinstance(hooks, list):
+        # Kiro (.kiro/hooks/*.json) : [{"trigger": …, "action": {"type": "command", …}}]
+        for hook in hooks[: _MAX_AUTO_RUNS * 10]:
+            if not isinstance(hook, dict) or not isinstance(hook.get("action"), dict):
+                continue
+            action = hook["action"]
+            program = _program(action.get("command")) if action.get("type") == "command" else None
+            if program and len(events_by_program) < _MAX_AUTO_RUNS:
+                event = str(hook.get("trigger", "a trigger"))
+                events = events_by_program.setdefault(program, [])
+                if event not in events and len(events) < _MAX_AUTO_RUNS:
+                    events.append(event)
+    for program, events in events_by_program.items():
+        shown = ", ".join(f"'{commands.shorten(event, 40)}'" for event in events[:3])
+        more = f" and {len(events) - 3} more" if len(events) > 3 else ""
+        flag(events[0], f"The AI client runs '{program}' automatically on {shown}{more} (hooks)")
+    tasks = data.get("tasks")
+    if isinstance(tasks, list):
+        for task in tasks[: _MAX_AUTO_RUNS * 10]:
+            if not isinstance(task, dict):
+                continue
+            # « windows », « linux », « osx » remplacent les propriétés de la tâche.
+            variants = [task] + [
+                variant
+                for platform in ("windows", "linux", "osx")
+                if isinstance(variant := task.get(platform), dict)
+            ]
+            if not any(
+                isinstance(options := variant.get("runOptions"), dict)
+                and options.get("runOn") == "folderOpen"
+                for variant in variants
+            ):
+                continue
+            program = next(
+                (
+                    task_program
+                    for variant in variants
+                    if (task_program := _program(variant.get("command")))
+                ),
+                "a task",
+            )
+            label = task.get("label")
+            named = f" '{commands.shorten(label, 40)}'" if isinstance(label, str) and label else ""
+            flag(
+                "runOn",
+                f"VS Code runs the task{named} ('{program}') as soon as the folder is opened "
+                "(runOn: folderOpen)",
+            )
+    for key, purpose in _CLAUDE_COMMAND_SETTINGS.items() if claude_settings else ():
+        setting = data.get(key)
+        command = setting.get("command") if isinstance(setting, dict) else setting
+        program = _program(command)
+        if program:
+            flag(key, f"Claude Code runs '{program}' {purpose} ({key})")
+    initialize = data.get("initializeCommand")
+    if isinstance(initialize, dict):
+        programs = [_program(command) for command in list(initialize.values())[:_MAX_AUTO_RUNS]]
+    else:
+        programs = [_program(initialize)]
+    for program in programs:
+        if program:
+            flag(
+                "initializeCommand",
+                f"The dev container runs '{program}' on your machine before it starts "
+                "(initializeCommand)",
+            )
+    return found
+
+
+def _claude_settings_env(data: object, claude_settings: bool) -> list[tuple[str, str]]:
+    """CW112 : bloc « env » des réglages de Claude Code (.claude/settings*.json), appliqué à
+    chaque session et à tous ses sous-processus : (clé, ce que la variable change)."""
+    if not claude_settings:
+        return []
+    block = data.get("env") if isinstance(data, dict) else None
+    if not isinstance(block, dict):
+        return []
+    found = []
+    variables = _environment_variables(block)
+    for key, value in list(block.items())[: _MAX_AUTO_RUNS * 10]:
+        if isinstance(value, str):
+            issue = _environment_issue(str(key), value, variables)
+            if issue:
+                found.append((str(key), issue))
+    return found[:_MAX_AUTO_RUNS]
 
 
 def _normalize_server(server: dict) -> dict:
@@ -1108,6 +1498,579 @@ def _http_host(url: str) -> str | None:
         return ""
 
 
+def _configured_value(value: str) -> str | None:
+    """La valeur réellement utilisée : None si vide ou simple référence (« ${VAR} »).
+
+    Contrairement aux secrets (CW103), les modèles à remplir ne sont PAS écartés ici : un
+    mot comme « example » dans une adresse ou un chemin ne doit pas suffire à cacher un
+    registre remplacé ou du code chargé en plus. La valeur par défaut de « ${VAR:-…} »
+    est celle qui s'appliquera.
+    """
+    candidate = value.strip()
+    for _ in range(20):  # ${A:-${B:-…}} : on descend, mais jamais indéfiniment
+        defaulted = _DEFAULTED_REFERENCE.fullmatch(candidate)
+        if defaulted is None:
+            break
+        candidate = defaulted.group(1).strip()
+    if not candidate or _ENV_REFERENCE.fullmatch(candidate):
+        return None
+    return candidate
+
+
+def _code_injection(
+    name: str, value: str, variables: dict[str, list[str]] | None = None
+) -> str | None:
+    """Ce que fait la variable `name` si elle fait charger du code en plus, sinon None.
+
+    `variables` : HOME et PATH posés en même temps (bloc « env » et ligne de commande)."""
+    if name in _PRELOAD_VARIABLES:
+        return _PRELOAD_VARIABLES[name] + f" ({name})"
+    if name in _NODE_OPTIONS_VARIABLES:
+        # Guillemets retirés : « NODE_OPTIONS='--require x' » écrit dans une ligne de commande.
+        options = [
+            word.strip("'\"").split("=", 1)[0] for word in value.split()[:_MAX_QUERY_PARAMETERS]
+        ]
+        for option in options:
+            if option in _NODE_CODE_OPTIONS:
+                return f"loads extra code ('{option}')"
+        for option in options:
+            if option in _NODE_DEBUG_OPTIONS:
+                return f"opens a debugger port: anyone who reaches it runs code ('{option}')"
+        return None
+    if name in _JAVA_OPTIONS_VARIABLES:
+        agent = _JAVA_AGENT.search(value)
+        return f"loads a Java agent ('{agent.group(1)}')" if agent else None
+    if name == "PERL5OPT":
+        module = _PERL_MODULE.search(value)
+        return f"loads a Perl module ('-{module.group(1)}')" if module else None
+    if name == "RUBYOPT":
+        return "loads a Ruby library ('-r')" if _RUBY_REQUIRE.search(value) else None
+    if name == "GIT_SSH_COMMAND":
+        return _git_ssh_issue(value, variables or {})
+    if name == "GIT_SSH":
+        return _git_ssh_program_issue(value, variables or {})
+    return None
+
+
+def _on_windows() -> bool:
+    """Le scanner tourne-t-il sous Windows ? Un chemin à lecteur (« C:/Windows/ssh ») n'y est un
+    chemin absolu que là : sous Linux et macOS, « C: » est un dossier du projet (revue de
+    l'Auditeur, 5e passe). Le résultat dépend donc du système qui lit la configuration."""
+    return sys.platform == "win32"
+
+
+def _pure_reference(text: str) -> str | None:
+    """Nom en majuscules de la variable, si `text` n'est qu'une référence à une variable."""
+    match = _PLAIN_REFERENCE.fullmatch(text)
+    return match.group(match.lastgroup).upper() if match and match.lastgroup else None
+
+
+class _Variables(dict):
+    """Les variables posées ensemble (nom en majuscules -> valeurs) et ce qu'il reste de budget de
+    lecture pour ce serveur : un fichier qui multiplie les références ne peut pas ralentir le scan
+    (revue de l'Auditeur, 6e passe)."""
+
+    def __init__(self, *args: object) -> None:
+        super().__init__(*args)  # type: ignore[arg-type]
+        self.reading = _MAX_READING
+
+    def charge(self, size: int) -> bool:
+        """Compte `size` caractères relus ; False quand le budget est épuisé."""
+        self.reading -= size
+        return self.reading >= 0
+
+
+def _environment_variables(
+    env_block: object = None, assignments: Iterable[tuple[str, str]] = ()
+) -> _Variables:
+    """Les variables posées ensemble : nom en majuscules -> valeurs. Viennent du bloc « env »
+    (ignoré s'il n'est pas un dict) et de la ligne de commande. Une variable qui ne fait que se
+    transmettre (« HOME=${HOME} ») n'est pas redéfinie."""
+    pairs = list(env_block.items()) if isinstance(env_block, dict) else []
+    pairs.extend(assignments)
+    found = _Variables()
+    for key, value in pairs:
+        name = str(key).strip().upper()
+        if isinstance(value, str) and _pure_reference(value) != name:
+            found.setdefault(name, []).append(value)
+    return found
+
+
+def _names_of(match: re.Match[str], whole: bool) -> tuple[str, ...]:
+    """Le nom de variable (en majuscules) qu'une référence désigne. « ${a-b} » est la variable
+    « a-b » pour npm (`whole`), « a » (valeur par défaut « b ») pour un shell ou Claude Code."""
+    group = match.group("g")
+    if group is None:
+        return (match.group(match.lastgroup).upper(),) if match.lastgroup else ()
+    inner = group.strip()
+    if inner[:4].lower() == "env:":
+        inner = inner[4:].strip()
+    if whole:
+        return (inner.upper(),)
+    head = _BRACED_NAME.match(inner)
+    return (head.group(0).upper(),) if head else ()
+
+
+def _known_expansions(value: str, variables: _Variables, own: str) -> tuple[list[str], bool]:
+    """`value` avec ses références à des variables posées ailleurs dans le même environnement
+    remplacées par leur valeur (npm développe lui-même « ${X} » dans ses réglages ; un shell,
+    « $X »), partout où elles apparaissent. Renvoie les textes obtenus et si tout a pu être lu :
+    au-delà des limites (trop de définitions, de références imbriquées ou de texte), on ne sait
+    pas, et l'appelant le dit. Les deux lectures de « ${a-b} » (voir `_names_of`) sont suivies,
+    chacune pour toutes les références du texte."""
+    found: list[str] = []
+    complete = True
+    if "$" not in value and "%" not in value:
+        return found, complete  # aucune référence à suivre
+    if len(value) > _MAX_EXPANDED_LENGTH:
+        return found, False
+
+    def walk(text: str, chain: tuple[str, ...], whole: bool) -> None:
+        nonlocal complete
+        if not variables.charge(len(text)):
+            complete = False
+            return
+        for match in _REFERENCE_IN_TEXT.finditer(text):
+            names = _names_of(match, whole)
+            # Soi-même : le réglage de l'utilisateur. Déjà remplacée plusieurs fois le long de ce
+            # chemin : une boucle (A=${B}, B=${A}). Une fois ne suffit pas : « $a${a-b} » remplace
+            # « a », puis la définition de « a-b » en cite encore.
+            if not names or names[0] == own or names[0] not in variables:
+                continue
+            if chain.count(names[0]) >= _MAX_REPEAT:
+                continue
+            name = names[0]
+            if len(chain) >= _MAX_REFERENCE_DEPTH or len(variables[name]) > _MAX_DEFINITIONS:
+                complete = False
+                return
+            for definition in variables[name]:
+                expanded = _REFERENCE_IN_TEXT.sub(
+                    lambda m, d=definition, n=name: (
+                        d if _names_of(m, whole) == (n,) else m.group(0)
+                    ),
+                    text,
+                )
+                if len(found) >= _MAX_EXPANSIONS or len(expanded) > _MAX_EXPANDED_LENGTH:
+                    complete = False
+                    return
+                found.append(expanded)
+                walk(expanded, (*chain, name), whole)  # les références suivantes
+            return
+
+    walk(value, (), True)
+    walk(value, (), False)
+    return found, complete
+
+
+def _is_system_location(path: str, *, home_known: bool = True) -> bool:
+    """Le chemin est-il dans un dossier du système ou dans un dossier d'outils de l'utilisateur
+    (caché ou « bin » ; sous « ~ » et « $HOME » seulement si HOME n'est pas redéfini) ? Jamais
+    avec « .. » : on peut en sortir. Pas « ~/projet » : le projet y est cloné par défaut.
+
+    `path` est le nom exact, tel que le programme le reçoit : rien n'est « nettoyé ». Le shell ne
+    retire ni espace, ni guillemet, ni espace insécable : « " /usr/bin/ssh" » est un dossier « »
+    (une espace) du projet (Auditeur, 7e passe). Tous les chemins de confiance commencent par « / »,
+    « ~ », « $ » ou une lettre de disque : ce qui précède les écarte déjà ; la fin est vérifiée.
+
+    « .. » se cherche dans le chemin tel qu'il est écrit, puis sans barres obliques inverses ni
+    guillemets : une ligne qui contient une barre oblique inverse garde le mot tel quel (chemin
+    Windows), mais un shell les retire, et « .\\. » ou « ..'' » y sont « .. » (revue de l'Auditeur,
+    10e passe). Retirer plus que le shell ne retire peut signaler à tort, jamais rater un « .. »."""
+    if path != path.strip():
+        return False
+    for written in (path, re.sub(r"""[\\'"]""", "", path)):
+        if ".." in re.split(r"[\\/]", written):
+            return False
+    probe = path.rstrip("/") + "/"
+    if probe.startswith(_SYSTEM_PREFIXES) or _USER_TOOLS.match(probe):
+        return True
+    # Un « : » après la lettre du disque n'existe pas dans un chemin Windows.
+    windows_path = _SYSTEM_WINDOWS.match(path) or _USER_TOOLS_WINDOWS.match(path)
+    if _on_windows() and ":" not in path[2:] and windows_path:
+        return True
+    return home_known and _HOME_TOOLS.match(probe) is not None
+
+
+def _path_is_system(path_value: str) -> bool:
+    """Tous les dossiers de ce PATH sont-ils sûrs ? Une entrée vide, c'est le dossier courant.
+    « $PATH » (la liste d'origine) est écarté. « ~ » et « $HOME » n'y sont pas développés (ni par
+    le client qui transmet l'environnement, ni par la recherche d'un programme) : « ~/bin » est un
+    dossier « ~ » du projet (revue de l'Auditeur, 6e passe)."""
+    separator = ":"
+    # Windows sépare par « ; » (et ses lettres de disque contiennent « : »), les autres par « : ».
+    if _on_windows() and (";" in path_value or re.match(r'"?[A-Za-z]:[\\/]', path_value)):
+        separator = ";"
+    for entry in path_value.split(separator):
+        # Sous Windows seulement, un dossier peut être entre guillemets (« "C:\Program Files\x" »).
+        # Ailleurs, comme partout, une espace ou un guillemet fait partie du nom du dossier.
+        if _on_windows() and len(entry) >= 2 and entry[0] == entry[-1] == '"':
+            entry = entry[1:-1]
+        if entry in _PATH_SELF:
+            continue
+        if not _is_system_location(entry, home_known=False):  # entrée vide : dossier courant
+            return False
+    return True
+
+
+def _ssh_option_arguments(words: list[str]) -> Iterator[tuple[str, str]]:
+    """(lettre, argument) des options -o, -I et -F de ssh, comme getopt les lit : « -o A=b »,
+    « -oA=b », « -vo A=b » (lettres groupées), « -I bibliothèque » et « -F fichier »."""
+    index = 1
+    while index < len(words):
+        word = words[index]
+        index += 1
+        if len(word) < 2 or word[0] != "-" or word[1] == "-":
+            continue
+        for position, letter in enumerate(word[1:], start=1):
+            if letter in "oIF":
+                rest = word[position + 1 :]
+                if rest:
+                    yield letter, rest
+                elif index < len(words):
+                    yield letter, words[index]
+                    index += 1
+                break
+            if letter in _SSH_LETTERS_WITH_ARGUMENT:
+                index += 0 if word[position + 1 :] else 1  # l'argument est le mot suivant
+                break
+
+
+def _ssh_program_option(letter: str, argument: str) -> str | None:
+    """Nom de l'option (`-o`, `-I`) qui lance un programme ou charge une bibliothèque."""
+    if letter == "I":  # -I : bibliothèque PKCS#11
+        key, rest = "pkcs11provider", argument
+    else:
+        # ssh sépare le nom de la valeur par « = » ou par n'importe quelle espace.
+        parts = re.split(r"[\s=]+", argument.strip(), maxsplit=1)
+        key, rest = parts[0], (parts[1] if len(parts) > 1 else "")
+    option = _SSH_PROGRAM_OPTIONS.get(key.lower())
+    if option and rest.strip().lower() not in _SSH_OFF_VALUES.get(option, ()):
+        return option
+    return None
+
+
+def _ssh_command_option(value: str, *, home_known: bool = True) -> str | None:
+    """Ce que fait une option de ssh qui lance un programme, charge une bibliothèque ou lit un
+    fichier de configuration (« -F ») du projet ; None sinon."""
+    words = commands.split_words(value)
+    for word in words[1:]:
+        if word.lower() == "-proxycmd":  # plink (PuTTY)
+            return "makes git's ssh run another program ('-proxycmd', GIT_SSH_COMMAND)"
+    for letter, argument in _ssh_option_arguments(words):
+        if letter == "F":
+            # « -F /dev/null » : ssh ne lit aucun fichier de configuration. Le fichier d'un
+            # dépôt, lui, peut contenir « ProxyCommand ».
+            if argument != "/dev/null" and not _is_system_location(argument, home_known=home_known):
+                return (
+                    "makes git's ssh read a configuration file that may come from the "
+                    "project ('-F', GIT_SSH_COMMAND)"
+                )
+        else:
+            option = _ssh_program_option(letter, argument)
+            if option:
+                return f"makes git's ssh run another program ('{option}', GIT_SSH_COMMAND)"
+    return None
+
+
+def _is_plain_ssh(
+    word: str, variables: dict[str, list[str]], home_known: bool, windows_line: bool
+) -> bool:
+    """« ssh », « plink » ou leur chemin dans un dossier du système : pas un « ./ssh », un
+    « bin/ssh » du projet, ni un faux chemin absolu (« /proc/self/cwd/ssh », « C:/ssh »).
+
+    `word` : le premier mot de `commands.program_word`. Dans une ligne qui contient une barre
+    oblique inverse (`windows_line`), ce mot garde ses guillemets, qu'on retire une fois ; sinon ils
+    sont déjà retirés, et un guillemet restant fait partie du nom. Le nom n'est jamais « nettoyé » :
+    une espace devant ou derrière, une espace insécable ou un guillemet en font un autre fichier."""
+    if windows_line and len(word) >= 2 and word[0] == word[-1] and word[0] in "\"'":
+        word = word[1:-1]
+    if word != word.strip() or word[:1] in ('"', "'"):
+        return False
+    if commands.executable_name(word) not in {"ssh", "plink"}:
+        return False
+    if "/" not in word and "\\" not in word:
+        # Nom seul : cherché dans le PATH. Un PATH posé avec le serveur peut y mettre le projet.
+        return all(_path_is_system(path) for path in variables.get("PATH", ()))
+    return _is_system_location(word, home_known=home_known)
+
+
+def _git_ssh_issue(value: str, variables: dict[str, list[str]]) -> str | None:
+    """GIT_SSH_COMMAND : « ssh -i clé » est normal ; une ligne trop longue pour être lue, une
+    variable posée devant ssh, un autre programme (ou un « ./ssh » du projet), du shell ou une
+    option qui lance un programme ne le sont pas. `variables` : HOME et PATH posés avec elle."""
+    if value.lstrip(" \t\n")[:1].isspace():
+        # Le shell ne saute que l'espace, la tabulation et le saut de ligne. Toute autre espace
+        # (insécable, cadratin, retour chariot…) commence le nom du programme, alors que
+        # `commands.program_word` la retire (revue de l'Auditeur, 7e passe).
+        return "makes git run a program whose name starts with an unusual space (GIT_SSH_COMMAND)"
+    if commands.starts_with_assignment(value):
+        # « LD_PRELOAD=./x.so ssh » : la variable s'applique à ssh (revue de l'Auditeur). Même
+        # seule, git lui ajoute l'hôte : « A=1 hôte » lance « hôte ».
+        return "makes git run ssh with variables set in front of it (GIT_SSH_COMMAND)"
+    word = commands.program_word(value)
+    if word is None:
+        return None
+    if len(value) > _SSH_LINE_LIMIT or len(commands.split_words(value)) > _MAX_QUERY_PARAMETERS:
+        # Ce qui dépasse la limite n'est pas lu : ne pas répondre « rien à signaler ».
+        return "makes git run a command line too long to be read (GIT_SSH_COMMAND)"
+    program = _program(value)
+    # HOME n'est connu que s'il n'est pas redéfini avec la commande. Toute autre variable
+    # (« $OPTS ») peut contenir des options ou des mots, et « $IFS » les couper.
+    home_known = "HOME" not in variables and not _UNEXPANDED_HOME.search(value)
+    text = _HOME_REFERENCE.sub("", value) if home_known else value
+    if _SHELL_CHARACTERS & set(text):
+        return f"makes git run '{program}' through a shell (GIT_SSH_COMMAND)"
+    if not _is_plain_ssh(word, variables, home_known, windows_line="\\" in value):
+        if commands.executable_name(word.strip("\"'")) in {"ssh", "plink"}:
+            return (
+                f"makes git run '{program}' from the project instead of the system "
+                "(GIT_SSH_COMMAND)"
+            )
+        return f"makes git run '{program}' through a shell (GIT_SSH_COMMAND)"
+    option = _ssh_command_option(value, home_known=home_known)
+    if option:
+        return option
+    if _UNUSUAL_SPACE.search(value):
+        # Même après le premier mot : « -F\r/etc/ssh/ssh_config » est un seul mot pour le shell
+        # (un fichier du projet), deux pour l'analyse (revue de l'Auditeur, 8e passe).
+        return (
+            "has a space the shell does not split on, so the program git runs may not be "
+            "the one read (GIT_SSH_COMMAND)"
+        )
+    return None
+
+
+def _git_ssh_program_issue(value: str, variables: dict[str, list[str]]) -> str | None:
+    """GIT_SSH : le programme que git lance à la place de ssh, sans shell et sans options. La valeur
+    entière est le nom du fichier (« ssh -i clé » en est un autre, introuvable). Seul « ssh » ou
+    « plink » du système est sûr ; « ./p/ssh » fait exécuter le fichier du projet, comme
+    GIT_SSH_COMMAND. Ni « ~ » ni « $HOME » n'y sont développés (un chemin « ~/bin/ssh » est un
+    dossier « ~ » du projet), donc HOME n'est jamais « connu » (revue de l'Auditeur, 10e passe)."""
+    if _is_plain_ssh(value, variables, home_known=False, windows_line=False):
+        return None
+    program = _program(value) or commands.UNKNOWN_PROGRAM
+    return f"makes git run '{program}' instead of the system's ssh (GIT_SSH)"
+
+
+def _foreign_registry(value: str) -> str | None:
+    """L'origine (« https://hôte/… ») du 1er index qui n'est ni officiel ni local, sinon None."""
+    for entry in value.split()[:_MAX_INDEX_ENTRIES]:
+        # « UV_INDEX=nom=https://… » : le nom de l'index précède l'adresse.
+        _, equals, address = entry.partition("=")
+        candidate = address if equals and "://" not in entry.split("=", 1)[0] else entry
+        if not candidate or _configured_value(candidate) is None or _is_local_path(candidate):
+            continue
+        if "://" not in candidate:
+            continue  # ni adresse ni chemin reconnu : pip et uv la refuseraient
+        try:
+            host = (urlparse(candidate).hostname or "").lower()
+        except ValueError:
+            return url_origin(candidate)  # une adresse qui ne se lit pas a au moins un schéma
+        if host in _OFFICIAL_REGISTRIES or host in _LOCAL_HOSTS:
+            continue
+        return _registry_origin(candidate)
+    return None
+
+
+def _registry_origin(address: str) -> str:
+    """L'origine d'une adresse de registre pour un message. Quand son schéma n'est pas lisible
+    (« ${S}://u:mdp@hôte », « 1https:// »), on ne sait pas où sont les identifiants : on n'en
+    garde rien (revue de l'Auditeur, 6e passe)."""
+    if _URL_SCHEME.match(address):
+        return url_origin(address)
+    return "…"
+
+
+def _shell_read_value(name: str, value: str) -> str | None:
+    """La valeur d'une variable que le shell développe (GIT_SSH_COMMAND, BASH_ENV) : None si vide
+    ou si elle ne fait que transmettre le réglage de l'utilisateur (« ${GIT_SSH_COMMAND} »,
+    « ${GIT_SSH_COMMAND:-ssh -i clé} »). « $X », lui, désigne une autre variable.
+
+    Seul le shell de GIT_SSH_COMMAND saute l'espace et la tabulation du début et de la fin. Pour
+    BASH_ENV, la valeur est le nom d'un fichier, espaces comprises : « " " » en est un (revue de
+    l'Auditeur, 7e passe)."""
+    blanks = " \t" if name == "GIT_SSH_COMMAND" else ""
+    candidate = value.strip(blanks)
+    for _ in range(20):  # ${A:-${A:-…}} : on descend, mais jamais indéfiniment
+        defaulted = _DEFAULTED_NAME.fullmatch(candidate)
+        if defaulted is None or defaulted.group("name").upper() != name:
+            break
+        candidate = defaulted.group("default").strip(blanks)
+    if not candidate or _pure_reference(candidate) == name:
+        return None
+    return candidate
+
+
+def _with_defaults(text: str, variables: _Variables) -> tuple[str, bool]:
+    """`text` où chaque « ${X:-défaut} » (et « ${X-…} », « ${X:=…} », « ${X=…} », « ${X:+…} ») est
+    remplacé par son défaut : ce que lit un client quand X est absente ou vide (ou, pour « + »,
+    définie), à n'importe quelle place du texte. La vraie valeur de X, si le bloc la pose, est
+    suivie par `_known_expansions`. Les défauts emboîtés se lisent de l'intérieur ; au-delà de
+    `_MAX_REFERENCE_DEPTH` niveaux, ou du budget de lecture, on ne sait pas : le second résultat
+    est alors False et l'appelant le dit."""
+    for _ in range(_MAX_REFERENCE_DEPTH):
+        replaced = _DEFAULT_IN_TEXT.sub(r"\1", text)
+        if replaced == text:
+            return text, True
+        if not variables.charge(len(replaced)):
+            return text, False
+        text = replaced
+    return text, _DEFAULT_IN_TEXT.search(text) is None
+
+
+def _client_default(match: re.Match[str]) -> str:
+    # `contenu.split(":-", 2)` de Claude Code : le défaut est le 2e morceau, pas tout le reste.
+    parts = match.group(1).split(":-", 2)
+    return parts[1] if len(parts) > 1 else match.group(0)
+
+
+def _client_reading(text: str, variables: _Variables) -> tuple[str, bool]:
+    """`text` comme Claude Code le lit quand ses variables sont absentes : chaque « ${nom:-défaut} »
+    devient « défaut », en une seule passe. Contrairement à un shell, le nom n'a pas de forme
+    imposée (« ${a.b:-r} », « ${1:-r} », « ${:-r} ») ; le contenu va jusqu'à la première « } »
+    (« ${${:-r} » lit « r ») et le défaut s'arrête à un deuxième « :- » (« ${U:-r:-z} » lit « r »).
+    Le second résultat est False quand le budget de lecture est épuisé (revue de l'Auditeur,
+    8e passe).
+
+    Rien ne peut correspondre après la dernière « } » : ce reste est mis de côté, sinon un texte
+    fait de « ${ » sans fin obligerait à le relire depuis chaque « ${ » (temps quadratique)."""
+    if ":-" not in text:
+        return text, True
+    end = text.rfind("}") + 1
+    read = _CLIENT_REFERENCE.sub(_client_default, text[:end]) + text[end:]
+    if not variables.charge(len(read)):
+        return text, False
+    return read, True
+
+
+_MAX_VIEW_DEPTH = 8  # imbrication lue dans un serveur (listes et objets) pour `_client_view`
+
+
+def _client_view(server: dict) -> dict | None:
+    """Le serveur tel que Claude Code le lit quand ses variables sont absentes : « ${A:-bash} » dans
+    `command`, `args`, `url`, `headers`, `env`… devient « bash ». Une copie ; None si rien ne
+    change. Les noms de champ ne sont pas lus, ni ce qui est plus profond que `_MAX_VIEW_DEPTH`
+    (laissé tel quel). Chaque texte a son propre budget de lecture (revue de l'Auditeur, 9e
+    passe)."""
+    changed = False
+
+    def read(value: object, depth: int) -> object:
+        nonlocal changed
+        if isinstance(value, str):
+            text, _ = _client_reading(value, _Variables())
+            changed = changed or text != value
+            return text
+        if depth >= _MAX_VIEW_DEPTH:
+            return value
+        if isinstance(value, list):
+            return [read(item, depth + 1) for item in value]
+        if isinstance(value, dict):
+            return {key: read(item, depth + 1) for key, item in value.items()}
+        return value
+
+    view = read(server, 0)
+    return view if changed and isinstance(view, dict) else None
+
+
+# Ce qui, dans un message, vient de la valeur lue : un texte entre apostrophes (nom, origine,
+# option) et la valeur masquée « (sk-a****…(40 chars)) ».
+_VALUE_FRAGMENT = re.compile(r"'[^']*'|\([^()]{0,4}\*{4}(?:…\(\d+ chars\))?\)")
+
+
+def _same_finding(finding: Finding) -> tuple[str, str]:
+    """Deux constats de la même règle qui ne diffèrent que par ce qui vient de la valeur lue sont le
+    même : le serveur d'origine et sa lecture par Claude Code disent « 'https://…' » et
+    « 'https://hôte/…' » du même registre, ou masquent deux fois le même secret."""
+    return finding.rule.id, _VALUE_FRAGMENT.sub("", finding.message)
+
+
+def _environment_issue(
+    key: str, value: str, variables: dict[str, list[str]] | None = None
+) -> str | None:
+    """CW112 : ce que change la variable `key` (texte du message, sans sa valeur), sinon None.
+
+    `variables` : les variables posées en même temps (voir `_environment_variables`). Une
+    référence à l'une d'elles (« ${X} ») est remplacée par sa valeur avant l'analyse."""
+    if not isinstance(variables, _Variables):
+        variables = _Variables(variables or {})
+    name = key.strip().upper()
+    if name in _SHELL_READ_VARIABLES:
+        return _issue_of_value(name, _shell_read_value(name, value), variables)
+    if not _is_checked_variable(name):
+        return None  # inutile de développer les références d'une variable que CW112 ignore
+    expansions, complete = _known_expansions(value, variables, name)
+    # Claude Code lit le texte d'abord ; npm ou le shell développent ensuite ce qui en sort avec les
+    # variables du même bloc : « $${a.b:-{}REG} » devient « ${REG} », puis la valeur de REG (revue
+    # de l'Auditeur, 9e passe). Les lectures déjà faites ne sont pas comptées deux fois.
+    clients = {value: _client_reading(value, variables)}
+    first = clients[value][0]
+    complete = complete and clients[value][1]
+    if first != value:
+        further, further_complete = _known_expansions(first, variables, name)
+        expansions = [first, *expansions, *further]
+        complete = complete and further_complete
+    for text in dict.fromkeys((value, *expansions)):
+        # Le texte tel quel, puis tel que le lit un client quand ses variables sont absentes :
+        # « -${U:-r} » lit « -r » (revue de l'Auditeur, 7e passe).
+        defaulted, readable = _with_defaults(text, variables)
+        if text not in clients:
+            clients[text] = _client_reading(text, variables)
+        client, client_readable = clients[text]
+        complete = complete and readable and client_readable
+        for reading in dict.fromkeys((text, defaulted, client)):
+            issue = _issue_of_value(name, _configured_value(reading), variables)
+            if issue:
+                return issue
+            if "$" in reading or "%" in reading:
+                # Une référence à une variable inconnue peut être vide : « ${X}--require ./h.js »
+                # lit « --require ./h.js » quand X n'existe pas (revue de ma propre simulation
+                # de npm).
+                issue = _issue_of_value(
+                    name, _configured_value(_REFERENCE_IN_TEXT.sub("", reading)), variables
+                )
+                if issue:
+                    return issue
+    if not complete:
+        return "has references to other variables that are too many or too deep to be read"
+    return None
+
+
+def _is_checked_variable(name: str) -> bool:
+    """CW112 regarde-t-elle la valeur de cette variable (en majuscules) ?"""
+    return (
+        name in _PRELOAD_VARIABLES
+        or name in _NODE_OPTIONS_VARIABLES
+        or name in _JAVA_OPTIONS_VARIABLES
+        or name in _REGISTRY_VARIABLES
+        or name in {"PERL5OPT", "RUBYOPT", "NPM_CONFIG_PACKAGE"}
+        or _NPM_SCOPED_REGISTRY.fullmatch(name) is not None
+    )
+
+
+def _issue_of_value(name: str, literal: str | None, variables: dict[str, list[str]]) -> str | None:
+    if literal is None:
+        return None  # vide, ou simple référence (« ${NODE_OPTIONS} »)
+    injected = _code_injection(name, literal, variables)
+    if injected:
+        return injected
+    if name in _REGISTRY_VARIABLES or _NPM_SCOPED_REGISTRY.fullmatch(name):
+        origin = _foreign_registry(literal)
+        if origin:
+            return f"takes its packages from '{origin}' instead of the official registry"
+        return None
+    if name == "NPM_CONFIG_PACKAGE":
+        return "installs extra packages through npm_config_package"
+    return None
+
+
+def _launcher_indexes(runner: str, args: list[str]) -> list[str]:
+    """Registres ou index donnés au lanceur lui-même (« npx --registry », « uvx -i »)."""
+    if runner in _NPM_LIKE_RUNNERS:
+        return [address for _, address in parse_npx(args).registries]
+    options = _options_before_package(runner, args)
+    return _option_values(options, _PYTHON_INDEX_OPTIONS)
+
+
 def _check_server(name: str, server: dict, line: int, path: str) -> list[Finding]:
     findings: list[Finding] = []
     command = server.get("command")
@@ -1116,6 +2079,8 @@ def _check_server(name: str, server: dict, line: int, path: str) -> list[Finding
 
     reported: set[tuple[str, str]] = set()
     env_block = server.get("env")
+    # HOME et PATH posés avec le serveur changent le sens de « ssh » et de « ~ » (CW112).
+    variables = _environment_variables(env_block)
     # « npm_config_call » : npm (npx, npm exec, et tout npm lancé par le serveur) exécute
     # cette ligne dans un shell, comme « npx -c ». Une valeur vide est ignorée par npm.
     npm_call_key = (
@@ -1144,6 +2109,7 @@ def _check_server(name: str, server: dict, line: int, path: str) -> list[Finding
         # Les enveloppes (cmd /c, wsl, env, sudo, uv run, bash -c…) sont retirées : on
         # vérifie le programme vraiment lancé, et on relève au passage les risques CW101.
         launch = commands.analyse(command, args)
+        variables = _environment_variables(env_block, launch.assignments)
 
         # CW101 : shell, ligne de commande ou code en ligne (une seule alerte par serveur)
         risks = launch.risks or (
@@ -1153,6 +2119,21 @@ def _check_server(name: str, server: dict, line: int, path: str) -> list[Finding
         )
         if risks:
             add(SHELL_EXECUTION, f"Server '{name}' {risks[0]}.")
+
+        # CW112 : variables posées sur la ligne de commande (« env A=1 », « export A=1 »…)
+        # et index de paquets de « uv run ».
+        for key, value in launch.assignments:
+            issue = _environment_issue(key, value, variables)
+            if issue:
+                add(UNSAFE_ENVIRONMENT, f"Server '{name}' {issue} (on its command line).")
+        for index in launch.indexes:
+            origin = _foreign_registry(index)
+            if origin:
+                add(
+                    UNSAFE_ENVIRONMENT,
+                    f"Server '{name}' takes its packages from '{origin}' instead of the "
+                    "official registry (on its command line).",
+                )
 
         # CW100 : script trop long ou trop imbriqué ; ce qui suit n'a pas été lu.
         if launch.truncated:
@@ -1210,6 +2191,15 @@ def _check_server(name: str, server: dict, line: int, path: str) -> list[Finding
                             UNPINNED_PACKAGE,
                             f"Server '{name}' runs '{redact_url(package)}' "
                             "without a pinned version.",
+                        )
+                # CW112 : registre ou index donné au lanceur (« npx --registry … »)
+                for index in _launcher_indexes(exe, args):
+                    origin = _foreign_registry(index)
+                    if origin:
+                        add(
+                            UNSAFE_ENVIRONMENT,
+                            f"Server '{name}' takes its packages from '{origin}' instead of "
+                            "the official registry (on its command line).",
                         )
                 # CW102 : paquets installés en plus du serveur (--with, 2e « -p »)
                 for extra in _extra_packages(exe, args):
@@ -1271,9 +2261,18 @@ def _check_server(name: str, server: dict, line: int, path: str) -> list[Finding
         if not isinstance(block, dict):
             continue
         for raw_key, value in block.items():
-            if not isinstance(value, str) or not value.strip():
+            if not isinstance(value, str):
                 continue
             key = str(raw_key)
+            # CW112 : code chargé en plus ou registre remplacé (le message ne recopie pas la
+            # valeur, seulement l'option en cause ou l'origine de l'adresse). Même une valeur
+            # d'espaces : « BASH_ENV=" " » exécute le fichier nommé « » (une espace).
+            issue = _environment_issue(key, value, variables) if block_name == "env" else None
+            if issue:
+                add(
+                    UNSAFE_ENVIRONMENT,
+                    f"Server '{name}' {issue} (env.{commands.shorten(key)}).",
+                )
             if block_name == "env" and _tls_disabled_by_env(key, value):
                 add(
                     INSECURE_TLS,
@@ -1340,15 +2339,27 @@ def _check_server(name: str, server: dict, line: int, path: str) -> list[Finding
     if server.get("trust") is True:
         add(AUTO_APPROVED_TOOLS, f"Server '{name}' is fully trusted (trust: true).")
 
+    # CW113 : programme lancé pour calculer les en-têtes d'un serveur distant (Claude Code)
+    helper = _program(server.get("headersHelper"))
+    if helper:
+        add(
+            AUTO_RUN_COMMAND,
+            f"Server '{name}' makes the AI client run '{helper}' to compute its headers "
+            "(headersHelper).",
+        )
+
     return findings
 
 
-def check_text(text: str, path: str, *, mcp_named: bool | None = None) -> list[Finding]:
+def check_text(
+    text: str, path: str, *, mcp_named: bool | None = None, folder: str = ""
+) -> list[Finding]:
     """Analyse un fichier JSON (ou JSONC) qui peut contenir des serveurs MCP.
 
     `mcp_named` : le fichier porte-t-il un nom propre à MCP ? Par défaut, déduit du
     chemin. Un fichier MCP illisible est signalé ; un autre fichier JSON illisible
-    reste silencieux (ce n'est probablement pas une configuration MCP).
+    reste silencieux (ce n'est probablement pas une configuration MCP). `folder` : dossier
+    réel du fichier, pour reconnaître `.claude/settings.json` analysé seul.
     """
     if mcp_named is None:
         mcp_named = is_mcp_config(PurePosixPath(path))
@@ -1359,7 +2370,7 @@ def check_text(text: str, path: str, *, mcp_named: bool | None = None) -> list[F
         # serveurs MCP : un outil tolérant aux erreurs pourrait quand même les lancer.
         if not mcp_named and not _mentions_mcp(text):
             return []
-        hint = "" if mcp_named else " The file seems to declare MCP servers."
+        hint = "" if mcp_named else " The file seems to declare MCP servers or automatic commands."
         return [
             Finding(
                 rule=INVALID_CONFIG,
@@ -1385,7 +2396,10 @@ def check_text(text: str, path: str, *, mcp_named: bool | None = None) -> list[F
 
     groups = _server_groups(data, mcp_named)
     settings = _auto_approve_settings(data)
-    if not groups and not settings:
+    claude_settings = _is_claude_settings(path, folder)
+    auto_runs = _auto_run_commands(data, claude_settings=claude_settings)
+    claude_env = _claude_settings_env(data, claude_settings)
+    if not groups and not settings and not auto_runs and not claude_env:
         return []
     # Numéros de ligne calculés sur le texte effectivement lu (commentaires
     # remplacés par des espaces, positions identiques).
@@ -1399,12 +2413,42 @@ def check_text(text: str, path: str, *, mcp_named: bool | None = None) -> list[F
         )
         for key, description in settings
     ]
+    findings += [
+        Finding(
+            rule=UNSAFE_ENVIRONMENT,
+            path=path,
+            line=key_lines.get(key, 1),
+            message=f"Claude Code {issue} in every session (env.{commands.shorten(key)}).",
+        )
+        for key, issue in claude_env
+    ]
+    findings += [
+        Finding(
+            rule=AUTO_RUN_COMMAND,
+            path=path,
+            line=key_lines.get(key, 1),
+            message=f"{description}.",
+        )
+        for key, description in auto_runs
+    ]
     for label, servers in groups:
         for raw_name, server in servers.items():
             name = raw_name + label
             line = key_lines.get(raw_name, 1)
             try:
-                findings.extend(_check_server(name, _normalize_server(server), line, path))
+                checked = _normalize_server(server)
+                found = _check_server(name, checked, line, path)
+                # Claude Code remplace « ${A:-défaut} » par son défaut quand A est absente : on lit
+                # aussi le serveur ainsi (revue de l'Auditeur, 9e passe).
+                view = _client_view(checked)
+                if view is not None:
+                    seen = {_same_finding(finding) for finding in found}
+                    found += [
+                        finding
+                        for finding in _check_server(name, view, line, path)
+                        if _same_finding(finding) not in seen
+                    ]
+                findings.extend(found)
             except Exception:
                 # Défense en profondeur : un contenu imprévu dans UN serveur ne doit ni
                 # faire planter le scan, ni masquer les problèmes des autres serveurs.

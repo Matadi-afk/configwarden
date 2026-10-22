@@ -218,6 +218,11 @@ _CONTAINER_WORDS = [
     "--cap-add", "ALL", "--security-opt", "seccomp=unconfined", "--mount",
     "type=bind,source=/,target=/h", "-e", "A=1", "--rm", "-it", "img:1.0", "--future", "dlx",
 ]  # fmt: skip
+_ENV_VALUES = [
+    "--require x.js", "-r", "--inspect", "https://pypi.example/simple", "a=https://x b=http://[",
+    "http://[broken", "${X:-${Y:---require z}}", "-javaagent:a.jar", "rubygems", "-MFoo",
+    "https://user:pw@host.example/simple", "",
+]  # fmt: skip
 # Une sous-commande en tête (« run », « exec »…) la moitié du temps, puis des mots tordus.
 launched_args = st.tuples(
     st.sampled_from([[], ["run"], ["container", "run"], ["exec"], ["dlx"], ["-c"]]),
@@ -225,7 +230,26 @@ launched_args = st.tuples(
 ).map(lambda parts: parts[0] + parts[1])
 launched_server = st.fixed_dictionaries(
     {"command": st.sampled_from(_LAUNCHERS), "args": launched_args},
-    optional={"env": st.dictionaries(st.sampled_from(["npm_config_call", "API_KEY"]), text)},
+    optional={
+        "env": st.dictionaries(
+            st.sampled_from(
+                [
+                    "npm_config_call",
+                    "API_KEY",
+                    "NODE_OPTIONS",
+                    "LD_PRELOAD",
+                    "PIP_INDEX_URL",
+                    "UV_INDEX",
+                    "npm_config_@x:registry",
+                    "JAVA_TOOL_OPTIONS",
+                    "RUBYOPT",
+                    "PERL5OPT",
+                    "BASH_ENV",
+                ]
+            ),  # fmt: skip
+            st.one_of(text, st.sampled_from(_ENV_VALUES)),
+        )
+    },
 )
 
 
@@ -281,6 +305,97 @@ def test_secrets_never_appear_in_any_report(placement, prefix, body, renderer) -
     report = RENDERERS[renderer](result, color=False)
     assert body not in report
     assert body[4:20] not in report  # pas même un long morceau
+
+
+# Fichiers qui ne sont pas des listes de serveurs : hooks, tâches, réglages (CW112, CW113).
+_FILE_PLACEMENTS = {
+    "claude-helper": (".claude/settings.json", lambda s: {"apiKeyHelper": f"T={s} ./k.sh"}),
+    "claude-helper-token": (".claude/settings.json", lambda s: {"apiKeyHelper": s}),
+    "claude-helper-token-args": (".claude/settings.json", lambda s: {"apiKeyHelper": f"{s} -x"}),
+    "claude-helper-substitution": (
+        ".claude/settings.json",
+        lambda s: {"apiKeyHelper": f"T=$(echo {s}) run"},
+    ),
+    "claude-helper-quoted": (
+        ".claude/settings.json",
+        lambda s: {"apiKeyHelper": f"T='{s} {s}' ./k.sh"},
+    ),
+    "claude-helper-unclosed": (".claude/settings.json", lambda s: {"apiKeyHelper": f"T='{s} k"}),
+    "claude-hook": (
+        ".claude/settings.json",
+        lambda s: {"hooks": {"Stop": [{"hooks": [{"command": f"T={s} run"}]}]}},
+    ),
+    "claude-status": (
+        ".claude/settings.json",
+        lambda s: {"statusLine": {"type": "command", "command": f"T={s} run"}},
+    ),
+    "claude-env": (
+        ".claude/settings.json",
+        lambda s: {"env": {"NODE_OPTIONS": f"--require ./h.js --token={s}"}},
+    ),
+    "claude-env-url": (
+        ".claude/settings.json",
+        lambda s: {"env": {"PIP_INDEX_URL": f"https://u:{s}@pypi.evil.example/simple"}},
+    ),
+    "cursor-hook": (".cursor/hooks.json", lambda s: {"hooks": {"stop": [{"command": f"T={s} h"}]}}),
+    "copilot-hook": (
+        ".github/hooks/h.json",
+        lambda s: {"hooks": {"sessionStart": [{"powershell": f"T={s} h"}]}},
+    ),
+    "task": (
+        ".vscode/tasks.json",
+        lambda s: {"tasks": [{"command": f"T={s} x", "runOptions": {"runOn": "folderOpen"}}]},
+    ),
+    "devcontainer": (
+        ".devcontainer/devcontainer.json",
+        lambda s: {"initializeCommand": f"T={s} x"},
+    ),
+    "devcontainer-list": (
+        ".devcontainer/devcontainer.json",
+        lambda s: {"initializeCommand": [f"T={s}/x", "bash"]},
+    ),
+    "headers-helper": (
+        "mcp.json",
+        lambda s: {
+            "mcpServers": {"s": {"url": "https://m.example.com/x", "headersHelper": f"T={s} h"}}
+        },
+    ),
+    "git-ssh-shell": (
+        "mcp.json",
+        lambda s: {"mcpServers": {"s": {"command": "x", "env": {"GIT_SSH_COMMAND": f"T={s} sh"}}}},
+    ),
+    "git-ssh-option": (
+        "mcp.json",
+        lambda s: {
+            "mcpServers": {
+                "s": {
+                    "command": "x",
+                    "env": {"GIT_SSH_COMMAND": f"ssh -o ProxyCommand=./h -o SendEnv={s}"},
+                }
+            }
+        },
+    ),
+}
+
+
+@given(
+    placement=st.sampled_from(sorted(_FILE_PLACEMENTS)),
+    prefix=secret_prefix,
+    body=secret_body,
+    renderer=st.sampled_from(sorted(RENDERERS)),
+)
+def test_secrets_never_appear_for_hooks_tasks_and_settings(
+    placement, prefix, body, renderer
+) -> None:
+    path, build = _FILE_PLACEMENTS[placement]
+    document = json.dumps(build(prefix + body))
+    result = ScanResult(
+        findings=[*mcp.check_text(document, path), *secrets.check_text(document, path)]
+    )
+    report = RENDERERS[renderer](result, color=False).lower()
+    # Même en minuscules : le nom d'un programme s'affiche en minuscules.
+    assert body.lower() not in report
+    assert body[4:20].lower() not in report  # pas même un long morceau
 
 
 @given(password=secret_body, user=st.text(alphabet=string.ascii_letters, max_size=8))
@@ -434,3 +549,25 @@ def test_ignore_apply_matches_a_naive_model(found, lines) -> None:
     ignore.apply(result, parsed, today=today)
     assert result.findings == expected_kept
     assert [(s.finding, s.line) for s in result.suppressed] == expected_suppressed
+
+
+# --- Commandes automatiques (CW113) ------------------------------------------------------
+
+_HOOK_KEYS = ["hooks", "tasks", "runOptions", "runOn", "folderOpen", "command", "type",
+              "initializeCommand", "label", "matcher"]  # fmt: skip
+hook_value = st.recursive(
+    st.one_of(json_leaf, st.sampled_from(_HOOK_KEYS)),
+    lambda children: st.one_of(
+        st.lists(children, max_size=4),
+        st.dictionaries(st.one_of(st.sampled_from(_HOOK_KEYS), text), children, max_size=4),
+    ),
+    max_leaves=25,
+)
+
+
+@given(document=st.dictionaries(st.sampled_from(_HOOK_KEYS), hook_value, max_size=4))
+def test_automatic_command_files_are_analysed_safely(document) -> None:
+    for name in (".claude/settings.json", ".vscode/tasks.json", "devcontainer.json"):
+        for finding in mcp.check_text(json.dumps(document), name):
+            _assert_clean(finding.message)
+            assert "could not be analysed" not in finding.message

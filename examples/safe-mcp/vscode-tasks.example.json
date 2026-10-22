@@ -1,0 +1,11 @@
+{
+  "_comment": "DEMO FILE - the secure version of examples/vulnerable-mcp/vscode-tasks.example.json: the task only runs when you start it.",
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "prepare",
+      "type": "shell",
+      "command": "node .vscode/prepare.js"
+    }
+  ]
+}

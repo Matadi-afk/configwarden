@@ -1,0 +1,12 @@
+{
+  "_comment": "DEMO FILE - a VS Code task that runs as soon as the folder is opened. Named so that VS Code does not load it.",
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "prepare",
+      "type": "shell",
+      "command": "node .vscode/prepare.js",
+      "runOptions": { "runOn": "folderOpen" }
+    }
+  ]
+}

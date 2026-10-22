@@ -252,8 +252,18 @@ _MAX_SPLITS = 20
 _MAX_WORDS = 200
 # Commandes vérifiées en plus de la 1re (« cd x && npx … ; uvx … »), par serveur.
 _MAX_COMMANDS = 20
+# Variables d'environnement et index de paquets gardés au plus, par serveur (CW112).
+_MAX_ASSIGNMENTS = 200
 # En tête d'une commande de script, ces mots ne lancent rien : on passe au suivant.
 _SCRIPT_KEYWORDS = {"!", "{", "if", "then", "else", "elif", "do", "while", "until"}
+# Commandes qui posent des variables d'environnement pour la suite du script (CW112) :
+# « export A=1 » (shells POSIX), « set A=1 » (cmd), « $env:A = 1 » (PowerShell).
+_EXPORT_WORDS = {"export", "declare", "typeset", "readonly", "local"}
+_POWERSHELL_ENV = re.compile(r"\$env:([A-Za-z_][A-Za-z0-9_]*)(=?)(.*)", re.IGNORECASE | re.DOTALL)
+# « uv run » : options qui remplacent l'index des paquets (CW112).
+_UV_INDEX_OPTIONS = {
+    "--index-url", "-i", "--default-index", "--extra-index-url", "--index", "--find-links", "-f",
+}  # fmt: skip
 _ASSIGNMENT_WORD = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=")
 _WINDOWS_WORD = re.compile(r'"[^"]*"|[&|<>]+|[^\s"&|<>]+')
 _POWERSHELL_WORD = re.compile(r'"[^"]*"|[&|<>;]+|[^\s"&|<>;]+')
@@ -274,6 +284,10 @@ class Launch:
     others: list[list[str]] = field(default_factory=list)
     # Vrai si une limite (nombre de commandes, imbrication) a empêché de tout lire.
     truncated: bool = False
+    # Variables d'environnement posées par la ligne de commande : « env A=1 », « A=1 cmd »,
+    # « export A=1 », « set A=1 », « $env:A = 1 » ; et index de paquets de « uv run ».
+    assignments: list[tuple[str, str]] = field(default_factory=list)
+    indexes: list[str] = field(default_factory=list)
 
     @property
     def executable(self) -> str:
@@ -305,6 +319,79 @@ def executable_name(command: str) -> str:
         if name.endswith(suffix):
             return name[: -len(suffix)]
     return name
+
+
+# Ce que `program_word` renvoie quand la ligne ne se lit pas sans risque de recopier une valeur.
+UNKNOWN_PROGRAM = "a command"
+_OPEN_SUBSTITUTIONS = ("`", "$(", "${", "(")
+# Un mot : des morceaux entre guillemets (espaces comprises) et des caractères sans blanc, collés.
+# « "ssh"x\\p » est UN mot, comme pour un shell, pas « "ssh" » suivi de « x\\p » (revue de
+# l'Auditeur, 9e passe). Un guillemet jamais fermé n'est qu'un caractère.
+_WINDOWS_PROGRAM_WORD = re.compile(r'(?:"[^"]*"|\S)+')
+
+
+def starts_with_assignment(command: str) -> bool:
+    """La ligne commence-t-elle par « NOM=valeur » (variable posée devant le programme) ?"""
+    return _ASSIGNMENT_WORD.match(command.lstrip()) is not None
+
+
+def program_word(command: str) -> str | None:
+    """Le programme d'une commande écrite sur une seule ligne, ou None s'il n'y en a pas.
+
+    Les affectations du début (« API_TOKEN=x ./k.sh ») sont sautées : ce n'est pas le
+    programme, et leur valeur peut être un jeton qu'un rapport ne doit jamais recopier.
+    Quand on ne sait pas où finit une valeur (guillemet jamais fermé, substitution, syntaxe
+    de Windows) ou quand la ligne est trop longue pour être lue en entier, on renvoie
+    `UNKNOWN_PROGRAM` : deviner un mot qui serait un bout de la valeur recopierait le secret,
+    et répondre « aucun programme » cacherait une commande que le shell exécute bien
+    (revue de l'Auditeur, 21 octobre 2026).
+    """
+    text = command.lstrip()
+    truncated = len(text) > _SCRIPT_LIMIT
+    text = text[:_SCRIPT_LIMIT]
+    unreadable = UNKNOWN_PROGRAM if truncated else None
+    if "\\" in text:
+        # Chemin ou syntaxe de Windows : les barres obliques inverses ne sont pas des échappements.
+        words = _WINDOWS_PROGRAM_WORD.findall(text)[:_MAX_WORDS]
+        if words and _ASSIGNMENT_WORD.match(words[0]):
+            return UNKNOWN_PROGRAM
+        return words[0] if words else unreadable
+    try:
+        lexer = shlex.shlex(text, posix=True)
+        lexer.whitespace_split = True
+        lexer.commenters = ""
+        start = 0
+        for word in lexer:
+            # Le mot tel qu'il est écrit (guillemets compris) : « ''a=x/ssh » est décodé en
+            # « a=x/ssh », mais un shell n'y voit pas d'affectation, le nom est entre guillemets :
+            # c'est le programme « a=x/ssh » (revue de l'Auditeur, 8e passe).
+            end = lexer.instream.tell()
+            written = text[start:end].lstrip()
+            start = end
+            if not _ASSIGNMENT_WORD.match(word) or not _ASSIGNMENT_WORD.match(written):
+                return word
+            if any(marker in word for marker in _OPEN_SUBSTITUTIONS):
+                # « T=$(echo a b) prog » : le shell ne coupe pas comme shlex, le mot suivant
+                # serait un bout de la valeur. Et la substitution s'exécute, même seule.
+                return UNKNOWN_PROGRAM
+        return unreadable
+    except ValueError:
+        # Guillemet jamais fermé : le shell refuserait la ligne, mais l'outil peut la lire
+        # autrement. On ne s'appuie que sur les mots qui précèdent le guillemet.
+        words = text.split()
+        for word in words[:_MAX_WORDS]:
+            if "'" in word or '"' in word:
+                return UNKNOWN_PROGRAM if _ASSIGNMENT_WORD.match(word) else word
+            if any(marker in word for marker in _OPEN_SUBSTITUTIONS):
+                return UNKNOWN_PROGRAM
+            if not _ASSIGNMENT_WORD.match(word):
+                return word
+        return UNKNOWN_PROGRAM if truncated or len(words) > _MAX_WORDS else None
+
+
+def split_words(text: str) -> list[str]:
+    """Mots d'un texte, comme les découpe un shell POSIX (guillemets, échappements)."""
+    return _split_words(text)
 
 
 def _interpreter(executable: str) -> str | None:
@@ -485,9 +572,12 @@ def _subcommand(
 
 
 def _after_run(
-    subcommand: tuple[str, str], tokens: list[str], index: int
+    subcommand: tuple[str, str], tokens: list[str], index: int, indexes: list[str] | None = None
 ) -> tuple[int, list[str], str | None]:
-    """`uv run [options] programme` : (position du programme, paquets --with, option shell)."""
+    """`uv run [options] programme` : (position du programme, paquets --with, option shell).
+
+    `indexes` reçoit les index de paquets donnés à `uv run` (« --index-url … », CW112).
+    """
     with_value = _RUN_SUBCOMMANDS[subcommand]
     sources: list[str] = []
     while index < len(tokens):
@@ -502,6 +592,11 @@ def _after_run(
                 sources.append(value)
             elif index + 1 < len(tokens):
                 sources.append(tokens[index + 1])
+        if subcommand == ("uv", "run") and name in _UV_INDEX_OPTIONS and indexes is not None:
+            if equals:
+                indexes.append(value)
+            elif index + 1 < len(tokens):
+                indexes.append(tokens[index + 1])
         if arg in with_value:
             index += 2
         elif arg.startswith("-"):
@@ -764,6 +859,8 @@ class _Work:
     splits: int = 0
     # Une limite a été atteinte : certaines commandes n'ont pas été lues (signalé, CW100).
     truncated: bool = False
+    assignments: list[tuple[str, str]] = field(default_factory=list)
+    indexes: list[str] = field(default_factory=list)
 
     def first_of(self, found: list[list[str]]) -> list[str]:
         """1re commande d'un script ; les suivantes attendent leur tour (20 au plus)."""
@@ -802,7 +899,42 @@ def analyse(command: str, args: list[str]) -> Launch:
         words=list(tokens),
         others=others,
         truncated=work.truncated,
+        assignments=work.assignments[:_MAX_ASSIGNMENTS],
+        indexes=work.indexes[:_MAX_ASSIGNMENTS],
     )
+
+
+def _unquote(text: str) -> str:
+    text = text.strip()
+    if len(text) >= 2 and text[0] == text[-1] and text[0] in "\"'":
+        return text[1:-1]
+    return text
+
+
+def _record_assignment(work: _Work, word: str) -> None:
+    """« NOM=valeur » -> (NOM, valeur), gardé pour CW112 (nombre borné)."""
+    name, equals, value = _unquote(word).partition("=")
+    if equals and name and len(work.assignments) < _MAX_ASSIGNMENTS:
+        work.assignments.append((name, _unquote(value)))
+
+
+def _powershell_assignment(tokens: list[str], start: int, work: _Work) -> bool:
+    """« $env:NOM = "valeur" » (un, deux ou trois mots) ; vrai si c'en est une."""
+    found = _POWERSHELL_ENV.fullmatch(tokens[start].strip())
+    if found is None:
+        return False
+    name, equals, rest = found.groups()
+    following = tokens[start + 1 : start + 3]
+    if equals and not rest and following:
+        rest = following[0]  # « $env:A="valeur" » : le découpage sépare les guillemets
+    elif not equals and following and following[0] == "=":
+        rest = following[1] if len(following) > 1 else ""
+    elif not equals and following and following[0].startswith("="):
+        rest = following[0][1:]
+    elif not equals:
+        return False
+    _record_assignment(work, f"{name}={_unquote(rest)}")
+    return True
 
 
 def _unwrap(tokens: list[str], work: _Work) -> list[str]:
@@ -818,9 +950,24 @@ def _unwrap(tokens: list[str], work: _Work) -> list[str]:
         if _ASSIGNMENT_WORD.match(tokens[start]) or tokens[start] in _SCRIPT_KEYWORDS:
             if _NPM_CONFIG_CALL.match(tokens[start]):
                 risks.append("executes a command line through 'npm_config_call'")
+            if _ASSIGNMENT_WORD.match(tokens[start]):
+                _record_assignment(work, tokens[start])
             start += 1  # « FOO=1 npx … », « then npx … » : rien n'est lancé par ce mot
             continue
+        if _powershell_assignment(tokens, start, work):
+            return []  # « $env:A = 1 » ne lance rien
         executable = executable_name(tokens[start])
+        if executable in _EXPORT_WORDS:
+            for word in tokens[start + 1 :]:
+                if _ASSIGNMENT_WORD.match(word):
+                    _record_assignment(work, word)
+            return []  # « export A=1 » ne lance rien
+        if executable == "set" and start + 1 < len(tokens):
+            # cmd : « set NOM=valeur avec espaces » (« set /a » et « set /p » : pas une variable).
+            rest = [word for word in tokens[start + 1 :] if not word.startswith("/")]
+            if rest:
+                _record_assignment(work, " ".join(rest))
+            return []
         if executable == "call":
             start += 1  # cmd : « call programme » lance ce programme
             continue
@@ -834,6 +981,9 @@ def _unwrap(tokens: list[str], work: _Work) -> list[str]:
             position, split = _after_env(tokens, start + 1)
             if any(_NPM_CONFIG_CALL.match(word) for word in tokens[start + 1 : position]):
                 risks.append("executes a command line through 'npm_config_call'")
+            for word in tokens[start + 1 : position]:
+                if _ASSIGNMENT_WORD.match(word):
+                    _record_assignment(work, word)
             if split is None:
                 start = position
                 continue
@@ -928,7 +1078,7 @@ def _unwrap(tokens: list[str], work: _Work) -> list[str]:
                     continue
                 if (executable, word) in _RUN_SUBCOMMANDS:
                     position, found_sources, shell_flag = _after_run(
-                        (executable, word), tokens, sub + 1
+                        (executable, word), tokens, sub + 1, work.indexes
                     )
                     sources.extend(found_sources)
                     if shell_flag is None and (executable, word) == ("pnpm", "exec"):
