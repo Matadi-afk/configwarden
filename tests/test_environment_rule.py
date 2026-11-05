@@ -361,7 +361,9 @@ def test_a_line_just_under_the_limit_is_read(write_mcp) -> None:
         "\\\\server\\share\\ssh.exe",
     ],
 )
-def test_only_the_systems_own_ssh_is_trusted(write_mcp, program) -> None:
+def test_only_the_systems_own_ssh_is_trusted(write_mcp, posix_host, program) -> None:
+    # Lecture de Linux et macOS (« C: » y est un dossier du projet) : le système est fixé,
+    # sinon le test échoue sous Windows, où ces chemins sont de vrais dossiers du système.
     assert ids_for(write_mcp, env_server("GIT_SSH_COMMAND", f"{program} -i key")) == ["CW112"]
 
 
@@ -514,7 +516,10 @@ def test_home_defined_but_not_used_is_fine(write_mcp, command) -> None:
         "/usr",
     ],
 )
-def test_path_pointing_into_the_project_makes_a_bare_ssh_untrusted(write_mcp, path) -> None:
+def test_path_pointing_into_the_project_makes_a_bare_ssh_untrusted(
+    write_mcp, posix_host, path
+) -> None:
+    # Même raison : sous Windows, « C:\\Windows\\System32 » est un dossier du système.
     server = env_block({"PATH": path, "GIT_SSH_COMMAND": "ssh -i key"})
     [finding] = findings_for(write_mcp, server)
     assert finding.rule.id == "CW112" and "from the project" in finding.message
