@@ -232,6 +232,20 @@ Le parking à idées. Une idée qui ne sert pas la phrase du projet atterrit ici
 - **Lanceurs pnpm dlx et bunx** : lus comme npx (options courantes identiques). Une lecture
   exacte de leurs propres règles éviterait de rares fausses alertes.
 
+## Revue finale de la 0.5.0 (5 novembre 2026)
+- **Tâches d'un espace de travail** : un fichier `*.code-workspace` peut contenir
+  `"tasks": {"tasks": [… "runOn": "folderOpen" …]}` ; il n'est pas lu (extension, et `tasks`
+  y est un objet). Faible : il faut que l'utilisateur ouvre ce fichier.
+- **`NPM_CONFIG_USERCONFIG=./x`** : npm lit alors son registre dans un fichier du projet.
+  Peu utile à un attaquant (npm lit déjà le `.npmrc` du dossier courant).
+- **Limites silencieuses de CW113** : au-delà de 100 entrées par événement ou de 100
+  programmes, la suite n'est pas détaillée (le fichier reste signalé) ; ajouter un message
+  « trop long » comme CW100.
+- **Nom de serveur qui ressemble à un secret** : recopié dans les messages depuis la 0.4.0
+  (`Server '…'`) ; le passer par `_shown_name` comme les noms d'événements et de tâches.
+- **Lenteur de `NODE_OPTIONS`** : environ 0,7 s au pire pour un fichier de 1 Mo avec
+  guillemets (lecture caractère par caractère) ; acceptable, à surveiller.
+
 ## Nouvelles idées
 - **Jeton collé comme nom de paquet (CW101/CW102)** : `npx -y <jeton>` recopie le nom du paquet dans
   le message. Cas artificiel et ancien (relevé par l'Auditeur, 6ᵉ passe), jamais vu dans le

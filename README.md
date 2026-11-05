@@ -19,7 +19,7 @@ AI agents (Claude, Cursor, VS Code Copilot…) are increasingly wired to tools t
 Requires Python 3.10+.
 
 ```bash
-pip install configwarden==0.4.0
+pip install configwarden==0.5.0
 configwarden scan .
 ```
 
@@ -64,8 +64,8 @@ Every value in `examples/` is a fake placeholder, and the example files are name
 | CW109 | high | AI client set to approve everything: Claude Code `enableAllProjectMcpServers` or `bypassPermissions`, VS Code `chat.tools.global.autoApprove`, Zed, Cursor `*:*`, Kiro Autopilot |
 | CW110 | high | TLS certificate checks turned off: `NODE_TLS_REJECT_UNAUTHORIZED=0`, `*_SSL_VERIFY=false`, `--insecure`, `--strict-ssl=false`, `--allow-insecure-host` |
 | CW111 | medium | Container image run by `docker run`, `podman run` or `nerdctl run` without a digest or an exact version: no tag, `:latest`, `:main`, `:stable`, a major version only (`:20`); Docker Hub official images (`node`) and local registries are ignored |
-| CW112 | high | Environment that changes what really runs: code loaded through `NODE_OPTIONS=--require`, `LD_PRELOAD`, `BASH_ENV`, a Java agent…, a debugger port (`--inspect`), or a non-official package registry (`PIP_INDEX_URL`, `npm_config_registry`, `npx --registry`, `uvx --index-url`), in a server's `env`, in Claude Code settings or on the command line |
-| CW113 | medium | Command run automatically by the AI client or the editor: hooks (Claude Code, Gemini CLI, Cursor, Copilot CLI, Windsurf, Kiro), Claude Code `statusLine` / `apiKeyHelper`…, MCP `headersHelper`, VS Code tasks with `"runOn": "folderOpen"`, dev container `initializeCommand` (the way the Shai-Hulud worm reinstalls itself) |
+| CW112 | high | Environment that changes what really runs: code loaded through `NODE_OPTIONS=--require` (read the way Node reads it) or `--openssl-config`, `LD_PRELOAD`, `BASH_ENV`, a Java agent…, a debugger port (`--inspect`), or a non-official package registry (`PIP_INDEX_URL`, `npm_config_registry`, `npx --registry`, `uvx --index-url`), in a server's `env`, in Claude Code settings or on the command line |
+| CW113 | medium | Command run automatically by the AI client or the editor: hooks (Claude Code, Gemini CLI, Cursor, Copilot CLI, Windsurf, Kiro), Claude Code `statusLine` / `apiKeyHelper`…, MCP `headersHelper`, VS Code tasks with `"runOn": "folderOpen"` or `"worktreeCreated"`, dev container `initializeCommand` (the way the Shai-Hulud worm reinstalls itself) |
 
 Commands hidden later in a shell script (`bash -c "cd /srv && npx -y server"`) are checked too.
 
@@ -129,7 +129,7 @@ jobs:
       - uses: actions/checkout@<commit-sha>   # v7
         with:
           persist-credentials: false
-      - uses: Matadi-afk/configwarden@<commit-sha>   # v0.4.0
+      - uses: Matadi-afk/configwarden@<commit-sha>   # v0.5.0
         with:
           fail-on: high                  # low (default), medium, high or critical
           sarif-file: configwarden.sarif # optional
@@ -141,7 +141,7 @@ jobs:
           sarif_file: configwarden.sarif
 ```
 
-Pin every action to a full commit SHA (`git ls-remote https://github.com/Matadi-afk/configwarden refs/tags/v0.4.0` prints the one for v0.4.0). The action needs no token and no permission, installs nothing, and runs configwarden in isolated mode with the Python already installed on the runner (3.10 or later; add `actions/setup-python` before it otherwise), so the scanned repository cannot replace its code. Results then appear in the repository's **Security → Code scanning** tab.
+Pin every action to a full commit SHA (`git ls-remote https://github.com/Matadi-afk/configwarden refs/tags/v0.5.0` prints the one for v0.5.0). The action needs no token and no permission, installs nothing, and runs configwarden in isolated mode with the Python already installed on the runner (3.10 or later; add `actions/setup-python` before it otherwise), so the scanned repository cannot replace its code. Results then appear in the repository's **Security → Code scanning** tab.
 
 File and server names from the scanned repository cannot drive the runner either: under GitHub Actions the text report is printed with workflow commands stopped (`::stop-commands::` and a random token), and `##` sequences (`##[…]`, Azure's `##vso[…]`) are neutralised in every report format.
 
@@ -150,7 +150,7 @@ File and server names from the scanned repository cannot drive the runner either
 ```yaml
 repos:
   - repo: https://github.com/Matadi-afk/configwarden
-    rev: <commit-sha>  # frozen: v0.4.0
+    rev: <commit-sha>  # frozen: v0.5.0
     hooks:
       - id: configwarden
 ```

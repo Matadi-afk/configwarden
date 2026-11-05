@@ -3,7 +3,7 @@
 #
 # Utilisation, dans le workflow d'un autre projet (épingler l'empreinte complète du
 # commit, jamais une étiquette, qui peut être déplacée) :
-#   - uses: Matadi-afk/configwarden@<empreinte du commit>  # v0.4.0
+#   - uses: Matadi-afk/configwarden@<empreinte du commit>  # v0.5.0
 #     with:
 #       fail-on: high
 #

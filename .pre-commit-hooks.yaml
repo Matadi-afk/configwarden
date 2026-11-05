@@ -3,7 +3,7 @@
 #
 # Dans le fichier .pre-commit-config.yaml d'un projet (épingler l'empreinte du commit) :
 #   - repo: https://github.com/Matadi-afk/configwarden
-#     rev: <empreinte du commit>  # frozen: v0.4.0
+#     rev: <empreinte du commit>  # frozen: v0.5.0
 #     hooks:
 #       - id: configwarden
 #

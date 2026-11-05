@@ -486,6 +486,52 @@ _PRELOAD_VARIABLES = {
 _NODE_OPTIONS_VARIABLES = {"NODE_OPTIONS", "NPM_CONFIG_NODE_OPTIONS"}
 _NODE_CODE_OPTIONS = {"-r", "--require", "--import", "--loader", "--experimental-loader"}
 _NODE_DEBUG_OPTIONS = {"--inspect", "--inspect-brk", "--inspect-wait"}
+# Fichier de configuration OpenSSL : il peut charger un « moteur », une bibliothèque native.
+_NODE_OPENSSL_CONFIG = "--openssl-config"
+
+
+def _node_option_words(value: str) -> list[str]:
+    """Les mots de NODE_OPTIONS, découpés comme Node (`ParseNodeOptionsEnvVar`).
+
+    Seule l'espace sépare deux mots ; `"` ouvre et ferme une chaîne n'importe où dans un mot
+    et disparaît ; dans une chaîne, `\\` garde le caractère suivant. Une valeur mal fermée est
+    refusée par Node, mais on garde ce qui a été lu : mieux vaut une alerte de trop."""
+    if '"' not in value:  # sans guillemet, « \\ » ne compte pas : découpage direct, plus rapide
+        return [word for word in value.split(" ") if word]
+    words: list[list[str]] = []  # listes de caractères : pas de recopie à chaque ajout
+    in_string = False
+    new_word = True
+    index = 0
+    while index < len(value):  # pas de limite de mots : Node lit tout (revue, 5 nov.)
+        char = value[index]
+        index += 1
+        if char == "\\" and in_string:
+            if index == len(value):
+                break
+            char = value[index]
+            index += 1
+        elif char == " " and not in_string:
+            new_word = True
+            continue
+        elif char == '"':
+            in_string = not in_string
+            if new_word:  # « "" » seul est un mot vide pour Node
+                words.append([])
+                new_word = False
+            continue
+        if new_word:
+            words.append([])
+            new_word = False
+        words[-1].append(char)
+    return ["".join(word) for word in words]
+
+
+def _node_option_name(word: str) -> str:
+    """Le nom d'une option de Node : avant « = », et « _ » vaut « - » (`--inspect_brk`)."""
+    name = word.split("=", 1)[0]
+    return name.replace("_", "-") if name.startswith("--") else name
+
+
 _JAVA_OPTIONS_VARIABLES = {"JAVA_TOOL_OPTIONS", "_JAVA_OPTIONS", "JDK_JAVA_OPTIONS"}
 _JAVA_AGENT = re.compile(
     r"(?:^|\s)(-javaagent|-agentpath|-agentlib|-XX:OnError|-XX:OnOutOfMemoryError)[:=]"
@@ -860,6 +906,18 @@ _TOKEN_LIKE = re.compile(r"[A-Za-z0-9_+-]{20,}")
 _PROGRAM_NAME = re.compile(r"[A-Za-z0-9_.-]{1,24}")
 
 
+_AUTO_RUN_TRIGGERS = {
+    "folderopen": "as soon as the folder is opened (runOn: folderOpen)",
+    "worktreecreated": "as soon as an agent session worktree is created (runOn: worktreeCreated)",
+}
+
+
+def _shown_name(name: str, fallback: str) -> str:
+    """Un nom tiré du fichier (événement, tâche), raccourci ; `fallback` s'il ressemble à un
+    secret : un rapport n'affiche jamais un secret en entier (revue de l'Auditeur, 5 nov.)."""
+    return fallback if _secret_like(name) else commands.shorten(name, 40)
+
+
 def _secret_like(word: str) -> bool:
     """Le mot (ou un des dossiers du chemin) ressemble-t-il à un secret ?"""
     for part in (word, *re.split(r"[\\/]", word)):
@@ -952,7 +1010,7 @@ def _auto_run_commands(data: object, *, claude_settings: bool = False) -> list[t
                 if event not in events and len(events) < _MAX_AUTO_RUNS:
                     events.append(event)
     for program, events in events_by_program.items():
-        shown = ", ".join(f"'{commands.shorten(event, 40)}'" for event in events[:3])
+        shown = ", ".join(f"'{_shown_name(event, 'an event')}'" for event in events[:3])
         more = f" and {len(events) - 3} more" if len(events) > 3 else ""
         flag(events[0], f"The AI client runs '{program}' automatically on {shown}{more} (hooks)")
     tasks = data.get("tasks")
@@ -966,11 +1024,16 @@ def _auto_run_commands(data: object, *, claude_settings: bool = False) -> list[t
                 for platform in ("windows", "linux", "osx")
                 if isinstance(variant := task.get(platform), dict)
             ]
-            if not any(
-                isinstance(options := variant.get("runOptions"), dict)
-                and options.get("runOn") == "folderOpen"
+            # VS Code compare sans tenir compte de la casse (`RunOnOptions.fromString`) ;
+            # « worktreeCreated » lance la tâche à la création d'un worktree de session
+            # d'agent (revue de l'Auditeur et code source de VS Code, 5 nov. 2026).
+            triggers = {
+                options["runOn"].lower()
                 for variant in variants
-            ):
+                if isinstance(options := variant.get("runOptions"), dict)
+                and isinstance(options.get("runOn"), str)
+            } & set(_AUTO_RUN_TRIGGERS)
+            if not triggers:
                 continue
             program = next(
                 (
@@ -981,12 +1044,16 @@ def _auto_run_commands(data: object, *, claude_settings: bool = False) -> list[t
                 "a task",
             )
             label = task.get("label")
-            named = f" '{commands.shorten(label, 40)}'" if isinstance(label, str) and label else ""
-            flag(
-                "runOn",
-                f"VS Code runs the task{named} ('{program}') as soon as the folder is opened "
-                "(runOn: folderOpen)",
+            named = (
+                f" '{_shown_name(label, '')}'"
+                if isinstance(label, str) and label and _shown_name(label, "")
+                else ""
             )
+            for trigger in (t for t in _AUTO_RUN_TRIGGERS if t in triggers):
+                flag(
+                    "runOn",
+                    f"VS Code runs the task{named} ('{program}') {_AUTO_RUN_TRIGGERS[trigger]}",
+                )
     for key, purpose in _CLAUDE_COMMAND_SETTINGS.items() if claude_settings else ():
         setting = data.get(key)
         command = setting.get("command") if isinstance(setting, dict) else setting
@@ -1526,13 +1593,20 @@ def _code_injection(
     if name in _PRELOAD_VARIABLES:
         return _PRELOAD_VARIABLES[name] + f" ({name})"
     if name in _NODE_OPTIONS_VARIABLES:
-        # Guillemets retirés : « NODE_OPTIONS='--require x' » écrit dans une ligne de commande.
-        options = [
-            word.strip("'\"").split("=", 1)[0] for word in value.split()[:_MAX_QUERY_PARAMETERS]
-        ]
+        # Deux lectures, et une alerte si l'une des deux trouve l'option : celle de Node
+        # (guillemets au milieu d'un mot, revue de l'Auditeur, 5 nov. 2026) et l'ancienne
+        # (guillemets simples retirés : « NODE_OPTIONS='--require x' » écrit dans une ligne
+        # de commande ; tabulations). Le message ne montre que le nom officiel de l'option.
+        words = _node_option_words(value) + [word.strip("'\"") for word in value.split()]
+        options = [_node_option_name(word) for word in words]
         for option in options:
             if option in _NODE_CODE_OPTIONS:
                 return f"loads extra code ('{option}')"
+        if _NODE_OPENSSL_CONFIG in options:
+            return (
+                "loads a native library through an OpenSSL configuration "
+                f"('{_NODE_OPENSSL_CONFIG}')"
+            )
         for option in options:
             if option in _NODE_DEBUG_OPTIONS:
                 return f"opens a debugger port: anyone who reaches it runs code ('{option}')"
