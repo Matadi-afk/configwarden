@@ -23,6 +23,14 @@ pip install configwarden==0.5.0
 configwarden scan .
 ```
 
+### Check your own machine
+
+```bash
+configwarden scan --user
+```
+
+Reads only the configuration files that AI clients keep for the current user (Claude Desktop, Claude Code, Cursor, VS Code and its forks, Cline, Roo Code, Windsurf, Gemini CLI, Zed, Kiro, Amazon Q, Copilot CLI, Continue), on Windows, macOS and Linux. It never walks your home folder, never opens the files where these tools keep login tokens (`.credentials.json`, `auth.json`, `oauth_creds.json`…), even through a link, and shows paths as `~/…` so a report does not reveal your user name. The list of files it read is printed first (on stderr). `~/.claude.json`, which also keeps conversation history, is read up to 64 MB. *(Not released yet: in the next version.)*
+
 ### Try it on the bundled example
 
 ```bash
@@ -92,6 +100,7 @@ Wrapped commands are unwrapped before being checked: `cmd /c npx …`, `wsl …`
 ## Usage
 
 ```bash
+configwarden scan --user [--format …] [--output FILE] [--fail-on …] [--ignore-file FILE]
 configwarden scan PATH [--format text|json|sarif] [--output FILE]
                      [--fail-on low|medium|high|critical] [--exclude GLOB]...
                      [--no-ignore | --ignore-file FILE]

@@ -246,6 +246,15 @@ Le parking à idées. Une idée qui ne sert pas la phrase du projet atterrit ici
 - **Lenteur de `NODE_OPTIONS`** : environ 0,7 s au pire pour un fichier de 1 Mo avec
   guillemets (lecture caractère par caractère) ; acceptable, à surveiller.
 
+## `scan --user` (6 novembre 2026)
+- **Emplacements à ajouter** (non vérifiés) : VS Code distant (`~/.vscode-server/data/User/`),
+  VSCodium, opencode (`~/.config/opencode/`), plugins Claude Code (`~/.claude/plugins/`),
+  Copilot pour JetBrains, Claude Desktop sous Linux (chemin officiel non trouvé).
+- **SARIF avec `--user`** : une URI `~/…` n'est peut-être pas acceptée par GitHub ; le
+  SARIF sert surtout en CI, où `--user` n'a pas de sens.
+- **`HOME` vide** : retombe sur `Path.home()` (le vrai dossier personnel). À trancher.
+- **Codex (TOML)** : `~/.codex/config.toml` est seulement signalé « non vérifié ».
+
 ## Nouvelles idées
 - **Jeton collé comme nom de paquet (CW101/CW102)** : `npx -y <jeton>` recopie le nom du paquet dans
   le message. Cas artificiel et ancien (relevé par l'Auditeur, 6ᵉ passe), jamais vu dans le

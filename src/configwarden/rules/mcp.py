@@ -26,6 +26,7 @@ import json
 import re
 import sys
 from collections.abc import Iterable, Iterator
+from contextvars import ContextVar
 from pathlib import PurePosixPath
 from urllib.parse import unquote, urlparse
 
@@ -696,6 +697,20 @@ def unreadable_config_finding(path: str) -> Finding:
     )
 
 
+def linked_secret_store_finding(path: str) -> Finding:
+    """`scan --user` : la configuration est un lien vers un fichier de jetons de connexion."""
+    return Finding(
+        rule=INVALID_CONFIG,
+        path=path,
+        line=1,
+        message=(
+            "This AI client configuration leads to a file that is not a JSON configuration, or "
+            "to a file where tools keep login tokens or keys. configwarden did not read it: "
+            "check where this link comes from."
+        ),
+    )
+
+
 def symlinked_config_finding(path: str) -> Finding:
     """Configuration (ou dossier de configuration) qui est un lien symbolique."""
     return Finding(
@@ -758,6 +773,27 @@ def _dig(data: object, *keys: str) -> object:
     return data
 
 
+# `scan --user` : dossier personnel de l'utilisateur, pour ne pas l'afficher. Les clés
+# `projects` de ~/.claude.json sont des chemins absolus (« /home/alice/repo ») : sans cela,
+# chaque constat montrerait le nom d'utilisateur (revue de l'Auditeur, 6 nov. 2026).
+HOME_FOR_DISPLAY: ContextVar[str] = ContextVar("configwarden_home_for_display", default="")
+
+
+def _shown_project(project_path: str) -> str:
+    """Le chemin d'un projet tel qu'affiché : `~/…` sous le dossier personnel, seulement son
+    dernier dossier ailleurs (« …/repo ») en mode --user ; tel quel sinon."""
+    home = HOME_FOR_DISPLAY.get()
+    if not home:
+        return project_path
+    key = project_path.replace("\\", "/").rstrip("/")
+    base = home.replace("\\", "/").rstrip("/")
+    if key.lower() == base.lower():
+        return "~"
+    if key.lower().startswith(base.lower() + "/"):
+        return "~/" + key[len(base) + 1 :]
+    return "…/" + key.rsplit("/", 1)[-1]
+
+
 def _server_groups(data: object, mcp_named: bool) -> list[tuple[str, dict[str, dict]]]:
     """Tous les groupes de serveurs d'un fichier : (précision d'affichage, serveurs)."""
     if not isinstance(data, dict):
@@ -773,7 +809,8 @@ def _server_groups(data: object, mcp_named: bool) -> list[tuple[str, dict[str, d
     projects = data.get("projects")
     if isinstance(projects, dict):
         for project_path, project in projects.items():
-            candidates.append((f" (project {project_path})", _dig(project, "mcpServers")))
+            shown = _shown_project(str(project_path))
+            candidates.append((f" (project {shown})", _dig(project, "mcpServers")))
     groups = []
     for label, servers in candidates:
         if isinstance(servers, dict):
@@ -939,7 +976,11 @@ def _is_claude_settings(path: str, folder: str = "") -> bool:
     name = location.name.lower()
     if name == "managed-settings.json":
         return True
-    parent = (location.parent.name or folder).lower()
+    if location.parent.name.lower() == "managed-settings.d" and name.endswith(".json"):
+        return True  # fragments des réglages gérés, lus comme managed-settings.json
+    # `folder` d'abord : c'est le dossier réel ou logique (`scan --user` avec
+    # CLAUDE_CONFIG_DIR : le dossier n'a pas le nom « .claude », mais il en joue le rôle).
+    parent = (folder or location.parent.name).lower()
     return parent == ".claude" and name.startswith("settings") and name.endswith(".json")
 
 

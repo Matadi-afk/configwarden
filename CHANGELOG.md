@@ -5,6 +5,16 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
 
 ## [Unreleased]
 
+### Added
+- **`configwarden scan --user`**: checks the AI client configurations of the current user on this machine, in one command, on Windows, macOS and Linux: Claude Desktop, Claude Code (`~/.claude.json`, `~/.claude/settings*.json`, managed settings), Cursor (MCP and hooks), VS Code, VS Code Insiders, Cursor and Windsurf user settings, MCP files and tasks (profiles included), Cline, Roo Code, Windsurf/Devin, Gemini CLI (settings and extensions), Zed, Kiro, Amazon Q, Copilot CLI and Continue. Locations come from each tool's official documentation; `CLAUDE_CONFIG_DIR`, `COPILOT_HOME`, `XDG_CONFIG_HOME` and `APPDATA` are followed. The list of files read is printed on stderr, and files in a format not supported yet (Codex `config.toml`, Continue `config.yaml`) are named, not silently skipped.
+  - It never walks the home folder: only a closed list of files (plus one bounded level for VS Code profiles, Gemini extensions and `managed-settings.d`, with a note when the limit is reached).
+  - Files where tools keep login tokens or keys are never read: by name (`.credentials.json`, `auth.json`, `oauth_creds.json`, `mcp-oauth-tokens.json`…), and by identity of the file actually opened, so a symbolic link, a hard link or a file swapped during the scan cannot make configwarden read one (Claude, Codex, Gemini, Copilot, git, npm, PyPI, AWS, Docker, GitHub CLI, Google Cloud, Azure, Kubernetes, SSH keys). A link is followed only to a JSON file, and a Gemini extension, installed from an unknown repository, cannot link outside its own folder; such a configuration is reported (CW100) and not read.
+  - Reports never show the user name: paths are shown as `~/…` or `$XDG_CONFIG_HOME/…`, and the project paths stored in `~/.claude.json` as `~/…` (or only their last folder outside the home folder).
+  - `~/.claude.json`, which also stores conversation history and is often larger than 1 MB, is read up to 64 MB; above that it is reported as unreadable (CW100). A file that is present but is not a regular file (a folder, a pipe) is reported too. No exceptions file is read on its own: only `--ignore-file`.
+
+### Security
+- Files are opened without blocking and checked again once open, so a file replaced by a pipe between the check and the read cannot make the scan hang.
+
 ## [0.5.0] - 2026-11-05
 
 ### Security

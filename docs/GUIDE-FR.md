@@ -79,7 +79,9 @@ pytest
 configwarden scan examples/vulnerable-mcp
 configwarden scan examples/safe-mcp
 ```
-✅ **Vérification :** une ligne `… passed` sans aucun `failed` (1 985 tests en version 0.5.0 ; sous Windows, quelques-uns sont sautés, `skipped` : c'est normal) ; 18 problèmes sur l'exemple vulnérable ; `No issues found.` sur l'exemple sécurisé.
+✅ **Vérification :** une ligne `… passed` sans aucun `failed` (2 035 tests ; sous Windows, quelques-uns sont sautés, `skipped` : c'est normal) ; 18 problèmes sur l'exemple vulnérable ; `No issues found.` sur l'exemple sécurisé.
+
+**Test réel sur ta machine :** `configwarden scan --user` vérifie les configurations de tes outils IA (Claude, Cursor, VS Code, Gemini CLI…). Il commence par lister les fichiers lus, puis affiche les problèmes. Il n'ouvre jamais les fichiers de jetons de connexion, et les chemins s'affichent en `~/…` : tu peux copier le rapport sans révéler ton nom d'utilisateur.
 
 **Astuce VS Code :** l'onglet *Testing* (icône en forme de fiole) liste et lance les tests. Avec `F5`, tu lances l'outil en mode débogage et tu peux poser des points d'arrêt.
 

@@ -5,6 +5,7 @@ Exemples :
     configwarden scan . --format sarif --output configwarden.sarif
     configwarden scan . --fail-on high --exclude "examples/*"
     configwarden scan . --no-ignore          (sans le fichier d'exceptions)
+    configwarden scan --user                 (les configurations des outils IA de ce poste)
     configwarden rules
 
 Codes de sortie (utiles en CI) :
@@ -21,12 +22,12 @@ import sys
 from pathlib import Path
 from secrets import token_hex
 
-from configwarden import __version__, ignore
+from configwarden import __version__, ignore, user_configs
 from configwarden.models import Severity
 from configwarden.redact import sanitize
 from configwarden.reporters import RENDERERS
 from configwarden.rules import ALL_RULES
-from configwarden.scanner import scan
+from configwarden.scanner import scan, scan_user
 
 EXIT_OK, EXIT_FINDINGS, EXIT_ERROR = 0, 1, 2
 
@@ -40,7 +41,15 @@ def _build_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="command", required=True)
 
     scan_cmd = sub.add_parser("scan", help="Scan a file or a directory.")
-    scan_cmd.add_argument("path", nargs="?", default=".", help="File or directory (default: .)")
+    scan_cmd.add_argument("path", nargs="?", default=None, help="File or directory (default: .)")
+    scan_cmd.add_argument(
+        "--user",
+        action="store_true",
+        help=(
+            "Scan the AI client configurations of the current user on this machine "
+            "(Claude, Cursor, VS Code, Gemini CLI, Windsurf, Zed...) instead of a folder."
+        ),
+    )
     scan_cmd.add_argument("--format", choices=sorted(RENDERERS), default="text")
     scan_cmd.add_argument("--output", "-o", help="Write the report to this file instead of stdout.")
     scan_cmd.add_argument(
@@ -172,14 +181,42 @@ def _apply_exceptions(result, explicit: str | None) -> str | None:
     return None
 
 
-def _cmd_scan(args: argparse.Namespace) -> int:
-    try:
-        result = scan(args.path, excludes=args.exclude)
-    except FileNotFoundError as error:
-        print(f"configwarden: error: {sanitize(str(error))}", file=sys.stderr)
-        return EXIT_ERROR
+def _scan_user(args: argparse.Namespace):
+    """`scan --user` : la liste des fichiers lus est annoncée (sur stderr, pour garder
+    JSON et SARIF lisibles par un programme) ; « aucun problème » ne vaut que pour elle."""
+    locations, notes = user_configs.user_locations()
+    if not locations:
+        print("configwarden: no AI client configuration found for this user.", file=sys.stderr)
+    else:
+        print(f"Checked {len(locations)} AI client configuration file(s):", file=sys.stderr)
+        for location in locations:
+            print(f"    {sanitize(location.shown)}", file=sys.stderr)
+    for note in notes:
+        print(sanitize(note), file=sys.stderr)
+    return scan_user(locations, home=user_configs.user_home())
 
-    if not args.no_ignore:
+
+def _cmd_scan(args: argparse.Namespace) -> int:
+    if args.user and (args.path is not None or args.exclude):
+        print(
+            "configwarden: error: --user scans this machine's AI client configurations; "
+            "it cannot be combined with a path or --exclude.",
+            file=sys.stderr,
+        )
+        return EXIT_ERROR
+    path = args.path if args.path is not None else "."
+    if args.user:
+        result = _scan_user(args)
+    else:
+        try:
+            result = scan(path, excludes=args.exclude)
+        except FileNotFoundError as error:
+            print(f"configwarden: error: {sanitize(str(error))}", file=sys.stderr)
+            return EXIT_ERROR
+
+    # --user : pas de fichier d'exceptions lu automatiquement (pas de projet) ; seul
+    # --ignore-file, choisi par l'utilisateur, s'applique.
+    if not args.no_ignore and (not args.user or args.ignore_file):
         problem = _apply_exceptions(result, args.ignore_file)
         if problem:
             print(f"configwarden: error: {problem}", file=sys.stderr)
@@ -194,7 +231,8 @@ def _cmd_scan(args: argparse.Namespace) -> int:
 
     if to_file:
         try:
-            _write_report(Path(args.output), report, roots=[Path.cwd(), Path(args.path)])
+            roots = [Path.cwd()] if args.user else [Path.cwd(), Path(path)]
+            _write_report(Path(args.output), report, roots=roots)
         except OSError as error:
             print(f"configwarden: error: {sanitize(str(error))}", file=sys.stderr)
             return EXIT_ERROR
