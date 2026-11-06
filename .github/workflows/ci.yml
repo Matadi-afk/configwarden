@@ -52,6 +52,10 @@ jobs:
         run: pytest
 
       - name: Audit des dépendances (vulnérabilités connues)
+        # Pas sous Python 3.10 (fin de vie en octobre 2026) : les correctifs des outils de dev
+        # (filelock >= 4.2.1) n'y existent plus. configwarden n'a aucune dépendance à
+        # l'exécution ; l'audit tourne sous 3.11, 3.12 et 3.13. Décision du 6 novembre 2026.
+        if: matrix.python-version != '3.10'
         run: pip-audit --skip-editable
 
   dogfooding:
